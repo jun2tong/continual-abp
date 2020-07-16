@@ -142,7 +142,7 @@ class FeatDataLayer(object):
 
     def forward(self):
         new_epoch = False
-        if self.cur + self.mini_batchsize >= len(self.label):
+        if self.cur + self.mini_batchsize >= self.num_obs:
             self._shuffle_roidb_inds()
             self.epoch += 1
             new_epoch = True
