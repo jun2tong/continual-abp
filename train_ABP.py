@@ -16,6 +16,7 @@ from collections import Counter
 
 import classifier
 from dataset_GBU import FeatDataLayer, DATA_LOADER
+from pre_train import pre_train_gmm, gaussian_pdfs_log
 
 
 parser = argparse.ArgumentParser()
@@ -29,7 +30,7 @@ parser.add_argument('--class_embedding', default='att', type=str)
 parser.add_argument('--task_split_num', type=int, default=5, help='number of task split')
 
 parser.add_argument('--nepoch', type=int, default=1000, help='number of epochs to train for')
-parser.add_argument('--lr', type=float, default=0.002, help='learning rate to train generater')
+parser.add_argument('--lr', type=float, default=0.002, help='learning rate to train generator')
 parser.add_argument('--classifier_lr', type=float, default=0.001, help='learning rate to train softmax classifier')
 parser.add_argument('--weight_decay', type=float, default=0.001, help='weight_decay')
 parser.add_argument('--batchsize', type=int, default=64, help='input batch size')
@@ -104,8 +105,6 @@ def train():
     netG = ConditionalGenerator(opt).to(device)
     netG.apply(weights_init)
     print(netG)
-    # out_dir = f'out/{opt.dataset}/nSample-{opt.nSample}_nZ-{opt.Z_dim}_sigma-{opt.sigma}_langevin_s-{opt.langevin_s}_' \
-    #           f'step-{opt.langevin_step}'
     out_dir = f'out/{opt.dataset}/nreplay-{opt.nSample_replay}_sigma-{opt.sigma}_langevin_s-{opt.langevin_s}_' \
               f'step-{opt.langevin_step}_nepoch-{opt.nepoch}'
     os.makedirs(out_dir, exist_ok=True)
@@ -137,6 +136,14 @@ def train():
 
     replay_mem = None
     task_stats = None
+
+    # pi_c = torch.ones(dataset.ntrain_class,).float() / dataset.ntrain_class
+    # pi_c.requires_grad_()
+    mu_c = torch.zeros(dataset.ntrain_class, opt.Z_dim).normal_(0, 3).float()
+    # mu_c.requires_grad_()
+    log_sigma2_c = torch.ones(dataset.ntrain_class, opt.Z_dim).float()
+    # log_sigma2_c.requires_grad_()
+
     task_locs = None
     all_task_dataloader = {}
     all_task_testdata = {}
@@ -161,21 +168,22 @@ def train():
         all_task_testdata[task_idx] = (dataset.test_seen_feature[task_mask], dataset.test_seen_label[task_mask])
         start_idx = tb
 
-        # TODO: Think about z initialization
-        train_z = torch.FloatTensor(task_dataloader.num_obs, opt.Z_dim).normal_(0, opt.latent_var)
-        if task_stats is not None:
-            task_locs = []
-            for key, val in task_stats.items():
-                task_locs.append(val[0].unsqueeze(0))
-            task_locs = torch.cat(task_locs, dim=0)
-            # train_z = loc_init_z(task_stats, replay_mem[1], opt.Z_dim, task_dataloader)
-
-        train_z = train_z.to(device)
+        train_z = torch.randn(task_dataloader.num_obs, opt.Z_dim).float().to(device)
+        if task_idx < 1:
+            mus, logsigma = pre_train_gmm(netG, train_z, dataset.train_att, task_dataloader,
+                                          len(np.unique(task_dataloader.label)), 10, device)
+            mu_c[:mus.size(0)] = mus.data
+            log_sigma2_c[:logsigma.size(0)] = logsigma.data
 
         print(f"============ Task {task_idx+1} ============")
         print(f"Task Labels: {np.unique(task_dataloader.label)}")
         print(f"Task training shape: {task_dataloader.feat_data.shape}")
         optimizerG = optim.Adam(netG.parameters(), lr=opt.lr, weight_decay=opt.weight_decay)
+        task_mu = mu_c[np.unique(task_dataloader.label)].to(device)
+        task_mu.requires_grad_()
+        task_logsigma = log_sigma2_c[np.unique(task_dataloader.label)].to(device)
+        task_logsigma.requires_grad_()
+        optimizerG.add_param_group({"params": [task_mu, task_logsigma]})
         total_niter = int(task_dataloader.num_obs/opt.batchsize) * opt.nepoch
         for it in range(start_step, total_niter+1):
             blobs = task_dataloader.forward()
@@ -188,18 +196,31 @@ def train():
             X = torch.from_numpy(feat_data).to(device)
             Z = nn.Parameter(train_z[idx]).to(device)
             optimizer_z = torch.optim.Adam([Z], lr=opt.lr, weight_decay=opt.weight_decay)
-
-            # Alternatingly update weights w and infer latent_batch z
+            scheduler_z = optim.lr_scheduler.StepLR(optimizer_z, step_size=50, gamma=0.5)
+            # Alternate update weights w and infer latent_batch z
             iter_loss = 0
             for em_step in range(1):  # EM_STEP
+                # update w
+                for _ in range(1):
+                    pred = netG(Z, C)
+                    recon_loss = get_recon_loss(pred, X, opt.sigma)
+                    prior_loss = get_prior_loss(Z, task_mu, task_logsigma, labels)
+                    entropy_loss = get_entropy_loss(Z, task_mu, task_logsigma, torch.from_numpy(labels).to(device))
+                    loss = recon_loss - prior_loss + entropy_loss
+                    scaled_loss = (task_dataloader.num_obs / Z.size(0)) * loss
+                    optimizerG.zero_grad()
+                    scaled_loss.backward()
+                    # torch.nn.utils.clip_grad_norm_(netG.parameters(), 5.)
+                    optimizerG.step()
+                    iter_loss += loss.detach()
                 # infer z
                 for _ in range(opt.langevin_step):
                     U_tau = torch.FloatTensor(Z.shape).normal_(0, opt.sigma_U).to(device)
                     pred = netG(Z, C)
-                    if task_locs is not None:
-                        loss = getloss(pred, X, Z, opt.sigma, task_locs, labels)
-                    else:
-                        loss = getloss(pred, X, Z, opt.sigma, None, labels)
+                    recon_loss = get_recon_loss(pred, X, opt.sigma)
+                    prior_loss = get_prior_loss(Z, task_mu, task_logsigma, labels)
+                    entropy_loss = get_entropy_loss(Z, task_mu, task_logsigma, torch.from_numpy(labels).to(device))
+                    loss = recon_loss - prior_loss + entropy_loss
                     scaled_loss = (task_dataloader.num_obs / Z.size(0)) * loss
                     scaled_loss = (opt.langevin_s ** 2) / 2 * scaled_loss
                     optimizer_z.zero_grad()
@@ -208,19 +229,7 @@ def train():
                     optimizer_z.step()
                     Z.data += opt.langevin_s * U_tau
                     iter_loss += loss.detach()
-                # update w
-                for _ in range(1):
-                    pred = netG(Z, C)
-                    if task_locs is not None:
-                        loss = getloss(pred, X, Z, opt.sigma, task_locs, labels)
-                    else:
-                        loss = getloss(pred, X, Z, opt.sigma, None, labels)
-                    scaled_loss = (task_dataloader.num_obs/Z.size(0)) * loss
-                    optimizerG.zero_grad()
-                    scaled_loss.backward()
-                    # torch.nn.utils.clip_grad_norm_(netG.parameters(), 5.)
-                    optimizerG.step()
-                    iter_loss += loss.detach()
+                scheduler_z.step()
             # update Z
             train_z[idx] = Z.data
 
@@ -230,7 +239,8 @@ def train():
 
             if it % opt.evl_interval == 0 and it:
                 netG.eval()
-                tmp_task_stats = get_class_stats(train_z, task_dataloader.label)
+                # tmp_task_stats = get_class_stats(train_z, task_dataloader.label)
+                tmp_task_stats = get_class_stats_imp(task_mu, task_logsigma, task_dataloader.label)
                 gen_feat, gen_label = synthesize_features(netG,
                                                           task_dataloader.label, task_dataloader.label,
                                                           dataset.train_att, tmp_task_stats,
@@ -247,7 +257,6 @@ def train():
                 log_print(f"Accuracy is {acc :.2f}%, Best_acc [{result_knn.best_acc :.2f}% "
                           f"| Iter-{result_knn.best_iter}]", log_dir)
 
-                # TODO: Use clustering prior
                 if result_knn.save_model:
                     files2remove = glob.glob(out_dir + '/Best_model_Knn_*')
                     for _i in files2remove:
@@ -261,10 +270,13 @@ def train():
                 save_model(it, netG, train_z, opt.manualSeed, log_text,
                            out_dir + '/Iter_{:d}.tar'.format(it))
                 print('Save model to ' + out_dir + '/Iter_{:d}.tar'.format(it))
+        mu_c[np.unique(task_dataloader.label)] = task_mu.data.to("cpu")
+        log_sigma2_c[np.unique(task_dataloader.label)] = task_logsigma.data.to("cpu")
         print(f"============ Task {task_idx + 1} CL Evaluation ============")
         netG.eval()
         # Generate features using labels seen so far.
-        task_stats = get_class_stats(train_z, task_dataloader.label)
+        # task_stats = get_class_stats(train_z, task_dataloader.label)
+        task_stats = get_class_stats_imp(task_mu, task_logsigma, task_dataloader.label)
         gen_feat, gen_label = synthesize_features(netG,
                                                   task_dataloader.label, task_dataloader.label,
                                                   dataset.train_att, task_stats,
@@ -287,7 +299,6 @@ def train():
         if opt.nSample_replay > 0:
             print(f"============ Generate replay ============")
             # TODO: Improve generated features quality?
-            task_stats = get_class_stats(train_z, task_dataloader.label)
             # torch.save({"latent_z": train_z.detach().to("cpu"),
             #             "labels": task_dataloader.label}, f"task{task_idx}_z.tar")
             replay_feat, replay_label = synthesize_features(netG,
@@ -320,27 +331,34 @@ def log_list(res_arr, log):
                 f.write(f"{res},")
 
 
-def getloss(pred, x, z, sigma, prior_locs, labels):
-    # loss = 1/(2*sigma**2) * torch.pow(x - pred, 2).sum() + 1/2 * torch.pow(z, 2).sum()
-    # loss /= x.size(0)
-    pred_loss = 1/(2*sigma**2) * torch.pow(x - pred, 2).sum()
-    prior_loss = get_prior_loss(z, prior_locs, labels)
-    loss = pred_loss + prior_loss
-    # loss *= scale_factor / x.size(0)
+def get_recon_loss(pred, x, sigma):
+    recon_loss = 1/(2*sigma**2) * torch.pow(x - pred, 2).sum()
+    return recon_loss
+
+
+def get_prior_loss(z, mus, log_sigma, labels):
+    pi_const = np.log(2.0 * np.pi)
+    var_term = log_sigma[labels]
+    dist_term = torch.pow(z - mus[labels], 2)/torch.exp(log_sigma[labels])
+    loss = -0.5 * torch.sum(pi_const + var_term + dist_term, dim=-1)
+    # log_pdf = gaussian_pdfs_log(z, mus, log_sigma, mus.size(0))
+    # yita_c = torch.exp(log_pdf) + 1e-10
+    # yita_c = yita_c / (yita_c.sum(1).view(-1, 1))  # batch_size*Clusters
+    return loss.sum()
+
+
+def get_entropy_loss(z, mus, log_sigma, labels):
+    loss_fcn = nn.NLLLoss(reduction='sum')
+    # TODO: vectorize this calculation
+    log_pdf = gaussian_pdfs_log(z, mus, log_sigma, mus.size(0))
+    yita_c = torch.exp(log_pdf) + 1e-10
+    yita_c = yita_c / (yita_c.sum(1).view(-1, 1))  # batch_size*Clusters
+    loss = loss_fcn(yita_c, labels)
     return loss
 
 
-def get_prior_loss(z, prior_locs, labels):
-    if prior_locs is not None:
-        prev_label_max = prior_locs.size(0)
-        mask = labels < prev_label_max
-        aval_label = labels[mask]
-        avl_loss = 1/2*torch.pow(z[mask] - prior_locs[aval_label].to(device), 2).sum()
-        unavl_loss = 1/2*torch.pow(z[~mask], 2).sum()
-        loss = avl_loss + unavl_loss
-    else:
-        loss = 1/2 * torch.pow(z, 2).sum()
-    return loss
+def kl_loss():
+    pass
 
 
 def save_model(it, netG, train_z, random_seed, log, fout):
@@ -363,6 +381,14 @@ def get_class_stats(latent, labels):
         z_samp = latent[mask]
         var, loc = torch.var_mean(z_samp, dim=0)
         train_stats[label] = (loc, var)
+    return train_stats
+
+
+def get_class_stats_imp(locs, sigmas, labels):
+    unique_label = np.unique(labels)
+    train_stats = {}
+    for ii, label in enumerate(unique_label):
+        train_stats[label] = (locs[label].detach(), sigmas[label].detach())
     return train_stats
 
 
