@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.init as init
+import torch.distributions as dist
 
 import glob
 import json
@@ -14,9 +15,9 @@ from time import gmtime, strftime
 from sklearn.metrics.pairwise import cosine_similarity
 from collections import Counter
 
-import classifier
+from classifier import eval_latent, eval_model_cls
 from dataset_GBU import FeatDataLayer, DATA_LOADER
-from pre_train import pre_train_gmm, gaussian_pdfs_log
+from pre_train import pre_train_gmm
 
 
 parser = argparse.ArgumentParser()
@@ -77,14 +78,14 @@ print(device)
 class ConditionalGenerator(nn.Module):
     def __init__(self, opt):
         super(ConditionalGenerator, self).__init__()
-        self.main = nn.Sequential(nn.Linear(opt.Z_dim+opt.C_dim, opt.gh_dim),
+        self.main = nn.Sequential(nn.Linear(opt.Z_dim, opt.gh_dim),
                                   nn.LeakyReLU(0.2, True),
                                   nn.Linear(opt.gh_dim, opt.X_dim),
-                                  nn.ReLU(True))
+                                  nn.Sigmoid())
 
     def forward(self, z, c):
-        in_vec = torch.cat([z, c], dim=1)
-        output = self.main(in_vec)
+        # in_vec = torch.cat([z, c], dim=1)
+        output = self.main(z)
         return output
 
 
@@ -141,7 +142,7 @@ def train():
     # pi_c.requires_grad_()
     mu_c = torch.zeros(dataset.ntrain_class, opt.Z_dim).normal_(0, 3).float()
     # mu_c.requires_grad_()
-    log_sigma2_c = torch.ones(dataset.ntrain_class, opt.Z_dim).float()
+    log_sigma2_c = torch.zeros(dataset.ntrain_class, opt.Z_dim).float()
     # log_sigma2_c.requires_grad_()
 
     task_locs = None
@@ -168,12 +169,17 @@ def train():
         all_task_testdata[task_idx] = (dataset.test_seen_feature[task_mask], dataset.test_seen_label[task_mask])
         start_idx = tb
 
-        train_z = torch.randn(task_dataloader.num_obs, opt.Z_dim).float().to(device)
+        # train_z = torch.randn(task_dataloader.num_obs, opt.Z_dim).float().to(device)
+        # prob_cat = torch.ones(task_dataloader.num_obs, dataset.ntrain_class) / dataset.ntrain_class
+        # prob_cat = prob_cat.float().to(device)
         if task_idx < 1:
-            mus, logsigma = pre_train_gmm(netG, train_z, dataset.train_att, task_dataloader,
-                                          len(np.unique(task_dataloader.label)), 10, device)
+            mus, logsigma = pre_train_gmm(opt.X_dim, opt.Z_dim, opt.gh_dim, task_dataloader,
+                                          len(np.unique(task_dataloader.label)), 10, device, netG)
             mu_c[:mus.size(0)] = mus.data
             log_sigma2_c[:logsigma.size(0)] = logsigma.data
+        task_init_stat = get_class_stats_imp(mu_c, log_sigma2_c, task_dataloader.label)
+        train_z = loc_init_z(task_init_stat, task_dataloader.label, opt.Z_dim, task_dataloader)
+        train_z = train_z.float().to(device)
 
         print(f"============ Task {task_idx+1} ============")
         print(f"Task Labels: {np.unique(task_dataloader.label)}")
@@ -190,29 +196,17 @@ def train():
             feat_data = blobs['data']  # image data
             labels = blobs['labels'].astype(int)  # class labels
             idx = blobs['idx'].astype(int)
-
             C = np.array([dataset.train_att[i, :] for i in labels])
             C = torch.from_numpy(C.astype('float32')).to(device)
             X = torch.from_numpy(feat_data).to(device)
-            Z = nn.Parameter(train_z[idx]).to(device)
-            optimizer_z = torch.optim.Adam([Z], lr=opt.lr, weight_decay=opt.weight_decay)
-            scheduler_z = optim.lr_scheduler.StepLR(optimizer_z, step_size=50, gamma=0.5)
+            # Z = nn.Parameter(train_z[idx]).to(device)
+            Z = train_z[idx]
+            Z.requires_grad_()
+            optimizer_z = torch.optim.Adam([Z, task_mu, task_logsigma], lr=opt.lr, weight_decay=opt.weight_decay)
+            # scheduler_z = optim.lr_scheduler.StepLR(optimizer_z, step_size=150, gamma=0.9)
             # Alternate update weights w and infer latent_batch z
             iter_loss = 0
             for em_step in range(1):  # EM_STEP
-                # update w
-                for _ in range(1):
-                    pred = netG(Z, C)
-                    recon_loss = get_recon_loss(pred, X, opt.sigma)
-                    prior_loss = get_prior_loss(Z, task_mu, task_logsigma, labels)
-                    entropy_loss = get_entropy_loss(Z, task_mu, task_logsigma, torch.from_numpy(labels).to(device))
-                    loss = recon_loss - prior_loss + entropy_loss
-                    scaled_loss = (task_dataloader.num_obs / Z.size(0)) * loss
-                    optimizerG.zero_grad()
-                    scaled_loss.backward()
-                    # torch.nn.utils.clip_grad_norm_(netG.parameters(), 5.)
-                    optimizerG.step()
-                    iter_loss += loss.detach()
                 # infer z
                 for _ in range(opt.langevin_step):
                     U_tau = torch.FloatTensor(Z.shape).normal_(0, opt.sigma_U).to(device)
@@ -220,16 +214,31 @@ def train():
                     recon_loss = get_recon_loss(pred, X, opt.sigma)
                     prior_loss = get_prior_loss(Z, task_mu, task_logsigma, labels)
                     entropy_loss = get_entropy_loss(Z, task_mu, task_logsigma, torch.from_numpy(labels).to(device))
-                    loss = recon_loss - prior_loss + entropy_loss
-                    scaled_loss = (task_dataloader.num_obs / Z.size(0)) * loss
-                    scaled_loss = (opt.langevin_s ** 2) / 2 * scaled_loss
+                    loss = recon_loss + prior_loss + entropy_loss
+                    loss = (task_dataloader.num_obs / Z.size(0)) * loss
+                    scaled_loss = (opt.langevin_s ** 2) * loss * 0.5
                     optimizer_z.zero_grad()
                     scaled_loss.backward()
                     # torch.nn.utils.clip_grad_norm_([Z], 5.)
                     optimizer_z.step()
                     Z.data += opt.langevin_s * U_tau
+                    # iter_loss += loss.detach()
+                # scheduler_z.step()
+                # TODO: infer y
+
+                # update w
+                for _ in range(1):
+                    pred = netG(Z, C)
+                    recon_loss = get_recon_loss(pred, X, opt.sigma)
+                    prior_loss = get_prior_loss(Z, task_mu, task_logsigma, labels)
+                    entropy_loss = get_entropy_loss(Z, task_mu, task_logsigma, torch.from_numpy(labels).to(device))
+                    loss = recon_loss + prior_loss + entropy_loss
+                    scaled_loss = (task_dataloader.num_obs / Z.size(0)) * loss
+                    optimizerG.zero_grad()
+                    scaled_loss.backward()
+                    # torch.nn.utils.clip_grad_norm_(netG.parameters(), 5.)
+                    optimizerG.step()
                     iter_loss += loss.detach()
-                scheduler_z.step()
             # update Z
             train_z[idx] = Z.data
 
@@ -239,19 +248,23 @@ def train():
 
             if it % opt.evl_interval == 0 and it:
                 netG.eval()
+                # acc = train_eval(task_dataloader.feat_data, task_dataloader.label,
+                #                  train_z, task_mu, task_logsigma, device)
+                acc = eval_latent(netG, task_dataloader.feat_data, task_dataloader.label, train_z,
+                                  task_mu, task_logsigma, opt.sigma, device)
                 # tmp_task_stats = get_class_stats(train_z, task_dataloader.label)
-                tmp_task_stats = get_class_stats_imp(task_mu, task_logsigma, task_dataloader.label)
-                gen_feat, gen_label = synthesize_features(netG,
-                                                          task_dataloader.label, task_dataloader.label,
-                                                          dataset.train_att, tmp_task_stats,
-                                                          opt.nSample, opt.X_dim, opt.Z_dim)
-
-                """Knn Classification"""
-                all_feas = gen_feat
-                all_label = gen_label
-                acc = eval_knn(all_feas.numpy(), all_label.numpy(),
-                               task_dataloader.feat_data, task_dataloader.label,
-                               opt.Knn)
+                # tmp_task_stats = get_class_stats_imp(task_mu, task_logsigma, task_dataloader.label)
+                # gen_feat, gen_label = synthesize_features(netG,
+                #                                           task_dataloader.label, task_dataloader.label,
+                #                                           dataset.train_att, tmp_task_stats,
+                #                                           opt.nSample, opt.X_dim, opt.Z_dim)
+                #
+                # """Knn Classification"""
+                # all_feas = gen_feat
+                # all_label = gen_label
+                # acc = eval_knn(all_feas.numpy(), all_label.numpy(),
+                #                task_dataloader.feat_data, task_dataloader.label,
+                #                opt.Knn)
                 result_knn.update(it, acc)
                 log_print(f"{opt.Knn}nn Classifer: ", log_dir)
                 log_print(f"Accuracy is {acc :.2f}%, Best_acc [{result_knn.best_acc :.2f}% "
@@ -275,18 +288,20 @@ def train():
         print(f"============ Task {task_idx + 1} CL Evaluation ============")
         netG.eval()
         # Generate features using labels seen so far.
-        # task_stats = get_class_stats(train_z, task_dataloader.label)
-        task_stats = get_class_stats_imp(task_mu, task_logsigma, task_dataloader.label)
-        gen_feat, gen_label = synthesize_features(netG,
-                                                  task_dataloader.label, task_dataloader.label,
-                                                  dataset.train_att, task_stats,
-                                                  opt.nSample, opt.X_dim, opt.Z_dim)
+        task_stats = get_class_stats(train_z, task_dataloader.label)
+        # task_stats = get_class_stats_imp(task_mu, task_logsigma, task_dataloader.label)
+        # gen_feat, gen_label = synthesize_features(netG,
+        #                                           task_dataloader.label, task_dataloader.label,
+        #                                           dataset.train_att, task_stats,
+        #                                           opt.nSample, opt.X_dim, opt.Z_dim)
         test_acc = []
         for atask in range(task_idx + 1):
             print(np.unique(all_task_testdata[atask][1]))
-            acc = eval_knn(gen_feat, gen_label,
-                           all_task_testdata[atask][0], all_task_testdata[atask][1],
-                           opt.Knn)
+            # acc = eval_knn(gen_feat, gen_label,
+            #                all_task_testdata[atask][0], all_task_testdata[atask][1],
+            #                opt.Knn)
+            acc = eval_model_cls(netG, all_task_testdata[atask][0], all_task_testdata[atask][1],
+                                 128, task_stats, opt.Z_dim, opt.sigma, device)
             test_acc.append(acc)
         result_knn.update_task_acc(test_acc)
         print(f"CL Task Accuracy: {test_acc}")
@@ -299,6 +314,7 @@ def train():
         if opt.nSample_replay > 0:
             print(f"============ Generate replay ============")
             # TODO: Improve generated features quality?
+            # TODO: invesate the task_mu and task_logsigma
             # torch.save({"latent_z": train_z.detach().to("cpu"),
             #             "labels": task_dataloader.label}, f"task{task_idx}_z.tar")
             replay_feat, replay_label = synthesize_features(netG,
@@ -310,6 +326,8 @@ def train():
             log_print(f"Replay labels: {np.unique(replay_label)}", log_dir)
             replay_mem = (replay_feat, replay_label)
         print(f"============ End of task {task_idx + 1} ============\n")
+        # import sys
+        # sys.exit()
         netG.train()
     result_knn.log_results(cl_acc_dir)
 
@@ -340,25 +358,20 @@ def get_prior_loss(z, mus, log_sigma, labels):
     pi_const = np.log(2.0 * np.pi)
     var_term = log_sigma[labels]
     dist_term = torch.pow(z - mus[labels], 2)/torch.exp(log_sigma[labels])
-    loss = -0.5 * torch.sum(pi_const + var_term + dist_term, dim=-1)
-    # log_pdf = gaussian_pdfs_log(z, mus, log_sigma, mus.size(0))
-    # yita_c = torch.exp(log_pdf) + 1e-10
-    # yita_c = yita_c / (yita_c.sum(1).view(-1, 1))  # batch_size*Clusters
-    return loss.sum()
-
-
-def get_entropy_loss(z, mus, log_sigma, labels):
-    loss_fcn = nn.NLLLoss(reduction='sum')
-    # TODO: vectorize this calculation
-    log_pdf = gaussian_pdfs_log(z, mus, log_sigma, mus.size(0))
-    yita_c = torch.exp(log_pdf) + 1e-10
-    yita_c = yita_c / (yita_c.sum(1).view(-1, 1))  # batch_size*Clusters
-    loss = loss_fcn(yita_c, labels)
+    dist_term = torch.sum(dist_term + var_term)
+    loss = 0.5 * (pi_const + dist_term)
     return loss
 
 
-def kl_loss():
-    pass
+def get_entropy_loss(z, mus, log_sigma, labels):
+    loss_fcn = nn.CrossEntropyLoss(reduction='sum')
+    num_mu = mus.size(0)
+    latent_dim = mus.size(1)
+    diag_mat = torch.eye(latent_dim).unsqueeze(0).to(device) * torch.exp(log_sigma).unsqueeze(1)
+    log_pdf = dist.MultivariateNormal(mus, diag_mat).log_prob(z.unsqueeze(1).repeat(1,num_mu,1))
+    yita_c = log_pdf
+    loss = loss_fcn(yita_c, labels)
+    return loss
 
 
 def save_model(it, netG, train_z, random_seed, log, fout):
@@ -398,8 +411,11 @@ def loc_init_z(locs, prev_labels, latent_dim, dataloader):
     for ii, task_label in enumerate(unique_task_labels):
         mask = dataloader.label == task_label
         # train_z[mask] += locs[ii].unsqueeze(0).repeat(np.sum(mask), 1)
-        train_z[mask] = torch.distributions.Normal(locs[task_label][0].to("cpu"),
-                                                   torch.sqrt(locs[task_label][1].to('cpu'))).sample([np.sum(mask)])
+        diag_mat = torch.exp(locs[task_label][1])*torch.eye(latent_dim)
+        train_z[mask] = dist.MultivariateNormal(locs[task_label][0].to("cpu"),
+                                                diag_mat.to("cpu")).sample([np.sum(mask)])
+        # train_z[mask] = dist.MultivariateNormal(locs[task_label][0].to("cpu"),
+        #                                         torch.eye(latent_dim)).sample([np.sum(mask)])
     return train_z
 
 
@@ -418,13 +434,11 @@ def synthesize_features(netG, test_labels, trained_labels, attr, class_stats, n_
             if test_label in class_stats.keys():
                 # z += class_locs[test_label].unsqueeze(0).repeat(n_samples, 1)
                 if replay:
-                    z = torch.distributions.Normal(class_stats[test_label][0],
-                                                   torch.ones(z_dim).to(device)).sample([n_samples])
+                    z = dist.Normal(class_stats[test_label][0],
+                                    torch.ones(z_dim).to(device)).sample([n_samples])
                 else:
-                    # z = torch.distributions.Normal(class_stats[test_label][0],
-                    #                                torch.sqrt(class_stats[test_label][1])).sample([n_samples])
-                    z = torch.distributions.Normal(class_stats[test_label][0],
-                                                   torch.ones(z_dim).to(device)).sample([n_samples])
+                    z = dist.Normal(class_stats[test_label][0],
+                                    torch.exp(class_stats[test_label][1])).sample([n_samples])
             G_sample = netG(z.to(device), test_feat)
             gen_feat[ii*n_samples:(ii+1)*n_samples] = G_sample
             gen_label = np.hstack((gen_label, np.ones([n_samples])*test_label))

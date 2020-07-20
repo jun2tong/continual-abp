@@ -19,6 +19,8 @@ class DATA_LOADER(object):
 
         if opt.dataset == 'imageNet1K':
             self.read_matimagenet(opt)
+        elif opt.dataset.lower() == "mnist":
+            self.read_pt(opt)
         else:
             self.read_matdataset(opt)
         self.index_in_epoch = 0
@@ -26,9 +28,9 @@ class DATA_LOADER(object):
         self.feature_dim = self.train_feature.shape[1]
         self.att_dim = self.attribute.shape[1]
         self.text_dim = self.att_dim
-        self.tr_cls_centroid = np.zeros([self.seenclasses.shape[0], self.feature_dim], np.float32)
-        for i in range(self.seenclasses.shape[0]):
-            self.tr_cls_centroid[i] = np.mean(self.train_feature[self.train_label == i].numpy(), axis=0)
+        # self.tr_cls_centroid = np.zeros([self.seenclasses.shape[0], self.feature_dim], np.float32)
+        # for i in range(self.seenclasses.shape[0]):
+        #     self.tr_cls_centroid[i] = np.mean(self.train_feature[self.train_label == i].numpy(), axis=0)
 
     def read_matimagenet(self, opt):
         if opt.preprocessing:
@@ -66,6 +68,24 @@ class DATA_LOADER(object):
         self.train_class = torch.from_numpy(np.unique(self.train_label.numpy()))
         self.ntrain_class = self.seenclasses.size(0)
         self.ntest_class = self.unseenclasses.size(0)
+
+    def read_pt(self, opt):
+        feature, label = torch.load(opt.dataroot + "/" + opt.dataset + "/processed/training.pt")
+        num_train = feature.size(0)
+        feature = feature.float()
+        test_feature, test_label = torch.load(opt.dataroot + "/" + opt.dataset + "/processed/test.pt")
+        num_test = test_feature.size(0)
+        test_feature = test_feature.float()
+        self.attribute = torch.randn(10, 10).numpy()
+        self.train_att = torch.randn(10, 10).numpy()
+        scaler = preprocessing.MinMaxScaler()
+        _train_feature = scaler.fit_transform(feature.view(num_train, -1).numpy())
+        _test_feature = scaler.transform(test_feature.view(num_test, -1).numpy())
+        self.train_feature = torch.from_numpy(_train_feature).float()
+        self.test_seen_feature = torch.from_numpy(_test_feature).float()
+        self.ntrain_class = 10
+        self.train_label = label.long()
+        self.test_seen_label = test_label.long()
 
     def read_matdataset(self, opt):
         matcontent = sio.loadmat(opt.dataroot + "/" + opt.dataset + "/" + opt.image_embedding + ".mat")
@@ -120,13 +140,16 @@ class FeatDataLayer(object):
         self.mini_batchsize = mini_batchsize
         self.feat_data = feat_data
         self.label = label
-        self._shuffle_roidb_inds()
         self.epoch = 0
         self.num_obs = len(label)
+        self.perm = None
+        self.cur = 0
+
+        self._shuffle_roidb_inds()
 
     def _shuffle_roidb_inds(self):
         """Randomly permute the training roidb."""
-        self.perm = np.random.permutation(np.arange(len(self.label)))
+        self.perm = np.random.permutation(np.arange(self.num_obs))
         self.cur = 0
 
     def _get_next_minibatch_inds(self):
@@ -141,18 +164,18 @@ class FeatDataLayer(object):
         return db_inds
 
     def forward(self):
-        new_epoch = False
         if self.cur + self.mini_batchsize >= self.num_obs:
+            db_inds = self.perm[self.cur:]
             self._shuffle_roidb_inds()
-            self.epoch += 1
-            new_epoch = True
+        else:
+            db_inds = self.perm[self.cur:self.cur + self.mini_batchsize]
+            self.cur += self.mini_batchsize
 
-        db_inds = self.perm[self.cur:self.cur + self.mini_batchsize]
-        self.cur += self.mini_batchsize
-
-        minibatch_feat = np.array([self.feat_data[i] for i in db_inds])
-        minibatch_label = np.array([self.label[i] for i in db_inds])
-        blobs = {'data': minibatch_feat, 'labels': minibatch_label, 'newEpoch': new_epoch, 'idx': db_inds}
+            # minibatch_feat = np.array([self.feat_data[i] for i in db_inds])
+            # minibatch_label = np.array([self.label[i] for i in db_inds])
+        minibatch_feat = self.feat_data[db_inds]
+        minibatch_label = self.label[db_inds]
+        blobs = {'data': minibatch_feat, 'labels': minibatch_label, 'idx': db_inds}
         return blobs
 
     def get_whole_data(self):
