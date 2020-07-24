@@ -4,6 +4,8 @@ The focus on this branch:
      - Works well for first and second task, but fails subsequently.  
      - Model not learning subsequent task.  
      - The model, p(x|z) = g(z), z from clustering prior.
-- [] Initialization of new Zs such that the new Zs are intialized away from previous clusters.  
+- [x] Currently, one cluster per class.  
+- [x] Z for previous class are initialized at previous state. Yield impressive remembering.  
 - [] Limit the proposals to be away from previously learned clusters.
 - [] Regularize the movement of previously learned cluster?
+- [] Initialize new cluster center away from previous center?
