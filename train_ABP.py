@@ -31,7 +31,7 @@ parser.add_argument('--class_embedding', default='att', type=str)
 parser.add_argument('--task_split_num', type=int, default=5, help='number of task split')
 
 parser.add_argument('--nepoch', type=int, default=1000, help='number of epochs to train for')
-parser.add_argument('--lr', type=float, default=0.005, help='learning rate to train generator')
+parser.add_argument('--lr', type=float, default=0.002, help='learning rate to train generator')
 parser.add_argument('--classifier_lr', type=float, default=0.001, help='learning rate to train softmax classifier')
 parser.add_argument('--weight_decay', type=float, default=0.001, help='weight_decay')
 parser.add_argument('--batchsize', type=int, default=64, help='input batch size')
@@ -41,10 +41,10 @@ parser.add_argument('--nSample_replay', type=int, default=100, help='number feat
 parser.add_argument('--resume',  type=str, help='the model to resume')
 parser.add_argument('--disp_interval', type=int, default=20)
 parser.add_argument('--save_task', type=int, default=0)
-parser.add_argument('--evl_interval',  type=int, default=100)
+parser.add_argument('--evl_interval',  type=int, default=200)
 parser.add_argument('--manualSeed', type=int, help='manual seed')
 
-parser.add_argument('--latent_dim', type=int, default=10, help='dimension of latent z')
+parser.add_argument('--latent_dim', type=int, default=32, help='dimension of latent z')
 parser.add_argument('--gh_dim',     type=int, default=2048, help='dimension of hidden layer in generator')
 parser.add_argument('--latent_var', type=float, default=1, help='variance of prior distribution z')
 
@@ -82,13 +82,13 @@ class ConditionalGenerator(nn.Module):
         #                           nn.LeakyReLU(0.2, True),
         #                           nn.Linear(opt.gh_dim, opt.X_dim),
         #                           nn.Sigmoid())
-        self.main = nn.Sequential(nn.Linear(opt.Z_dim, 2000),
+        self.main = nn.Sequential(nn.Linear(opt.Z_dim, 400),
                                   nn.ReLU(True),
-                                  nn.Linear(2000, 500),
+                                  nn.Linear(400, 400),
                                   nn.ReLU(True),
-                                  nn.Linear(500, 500),
+                                  nn.Linear(400, 400),
                                   nn.ReLU(True),
-                                  nn.Linear(500, opt.X_dim),
+                                  nn.Linear(400, opt.X_dim),
                                   nn.Sigmoid())
 
     def forward(self, z, c):
@@ -155,19 +155,6 @@ def train():
     all_task_testdata = {}
     log_print(f"Task Boundary: {task_boundary} \n", log_dir)
     for task_idx, tb in enumerate(task_boundary):
-        if opt.resume and task_idx < 1:
-            if os.path.isfile(opt.resume):
-                # print("=> loading checkpoint '{}'".format(opt.resume))
-                # checkpoint = torch.load(opt.resume)
-                netG.load_state_dict(checkpoint['state_dict_G'])
-                replay_stats = (checkpoint['replay_mem0'].to(device),
-                                checkpoint['replay_mem1'].to(device),
-                                checkpoint['replay_mem2'].to(device))
-                replay_mem = (replay_stats[0], replay_stats[1])
-            else:
-                print("=> no checkpoint found at '{}'".format(opt.resume))
-            print("========= Skipping Task 1 =========\n")
-            continue
 
         task_mask_1 = dataset.train_label >= start_idx
         task_mask_2 = dataset.train_label < tb
@@ -188,6 +175,24 @@ def train():
         all_task_testdata[task_idx] = (dataset.test_seen_feature[task_mask], dataset.test_seen_label[task_mask])
         start_idx = tb
 
+        if opt.resume and task_idx < 1:
+            if os.path.isfile(opt.resume):
+                # print("=> loading checkpoint '{}'".format(opt.resume))
+                # checkpoint = torch.load(opt.resume)
+                netG.load_state_dict(checkpoint['state_dict_G'])
+                replay_stats = (checkpoint['replay_mem0'],
+                                checkpoint['replay_mem1'],
+                                checkpoint['replay_mem2'])
+                mus = checkpoint["mu"]
+                logsigma = checkpoint["logsigma"]
+                mu_c[:mus.size(0)] = mus.data
+                log_sigma2_c[:logsigma.size(0)] = logsigma.data
+                replay_mem = (replay_stats[0], replay_stats[1])
+            else:
+                print("=> no checkpoint found at '{}'".format(opt.resume))
+            print("========= Skipping Task 1 =========\n")
+            continue
+
         # train_z = torch.randn(task_dataloader.num_obs, opt.Z_dim).float().to(device)
         if task_idx < 1:
             print("Pre-training Initialization")
@@ -197,11 +202,13 @@ def train():
             mu_c[:mus.size(0)] = mus.data
             log_sigma2_c[:logsigma.size(0)] = logsigma.data
         else:
-            # TODO: initialize mu away from previous mu
-            pass
+            # pass
+            boundary = [0,2,4,6,8][task_idx]
+            mus = loc_init_mu(mu_c[:boundary], mu_c[boundary:boundary+2])
+            mu_c[boundary:boundary+2] = mus.data
+
         task_init_stat = get_class_stats_imp(mu_c, log_sigma2_c, task_dataloader.label)
         train_z = loc_init_z(task_init_stat, task_dataloader.label, opt.Z_dim, task_dataloader)
-        prev_z_size = train_z.size(0)
         if task_idx > 0 and replay_stats is not None:
             prev_z_size = replay_stats[-1].size(0)
             train_z[:prev_z_size] = replay_stats[-1]
@@ -222,15 +229,15 @@ def train():
             feat_data = blobs['data']  # image data
             labels = blobs['labels'].astype(int)  # class labels
             idx = blobs['idx'].astype(int)
-            subset_idx_mask = idx < prev_z_size
-            subset_idx = idx[subset_idx_mask]
+            # subset_idx_mask = idx < prev_z_size
+            # subset_idx = idx[subset_idx_mask]
             C = np.array([dataset.train_att[i, :] for i in labels])
             C = torch.from_numpy(C.astype('float32')).to(device)
             X = torch.from_numpy(feat_data).to(device)
             Z = train_z[idx]
             Z.requires_grad_()
             optimizer_z = torch.optim.Adam([Z, task_mu, task_logsigma], lr=opt.lr, weight_decay=opt.weight_decay)
-            scheduler_z = optim.lr_scheduler.StepLR(optimizer_z, step_size=20, gamma=0.9)
+            scheduler_z = optim.lr_scheduler.StepLR(optimizer_z, step_size=2, gamma=0.9)
             # Alternate update weights w and infer latent_batch z
             iter_loss = 0
             for em_step in range(1):  # EM_STEP
@@ -256,7 +263,7 @@ def train():
                     optimizer_z.step()
                     Z.data += opt.langevin_s * U_tau
                     # iter_loss += loss.detach()
-                scheduler_z.step()
+                    scheduler_z.step()
                 # TODO: regularize Z
 
                 # update w
@@ -321,18 +328,21 @@ def train():
         if opt.nSample_replay > 0:
             print(f"============ Generate replay ============")
             # TODO: Improve generated features quality?
+            # TODO: Stabilize sampling variation from latent distribution.
+            # task_stats = get_class_stats_imp(task_mu, task_logsigma, task_dataloader.label)
             # torch.save({"latent_z": train_z.detach().to("cpu"),
             #             "labels": task_dataloader.label}, f"task{task_idx}_z.tar")
             replay_stats = synthesize_features(netG,
                                                task_dataloader.label, task_dataloader.label,
                                                dataset.train_att, task_stats,
                                                opt.nSample_replay, opt.X_dim, opt.Z_dim, True)
-            # replay_feat, replay_label = samp_features(task_dataloader.label, task_dataloader.feat_data, opt.nSample_replay)
+            # replay_stats = samp_features(task_dataloader.label, task_dataloader.feat_data, train_z,
+            #                              opt.nSample_replay)
             log_print(f"Replay on: {replay_stats[0].shape}", log_dir)
             log_print(f"Replay labels: {np.unique(replay_stats[1])}", log_dir)
             replay_mem = (replay_stats[0], replay_stats[1])
         if opt.save_task and task_idx < 1:
-            save_model(it, netG, replay_stats, opt.manualSeed, log_dir, cl_acc_dir,
+            save_model(it, netG, replay_stats, opt.manualSeed, log_dir, cl_acc_dir, task_mu, task_logsigma,
                        f"{out_dir}/train_task_{task_idx+1}.tar")
             print(f'Save model to {out_dir}/train_task_{task_idx+1}.tar')
         print(f"============ End of task {task_idx + 1} ============\n")
@@ -385,7 +395,7 @@ def get_entropy_loss(z, mus, log_sigma, labels):
     return loss, yita_c
 
 
-def save_model(it, netG, replay_stats, random_seed, log, acc_log, fout):
+def save_model(it, netG, replay_stats, random_seed, log, acc_log, mus, logsigma, fout):
     torch.save({
         'it': it + 1,
         'state_dict_G': netG.state_dict(),
@@ -393,6 +403,8 @@ def save_model(it, netG, replay_stats, random_seed, log, acc_log, fout):
         'replay_mem1': replay_stats[1].cpu().detach(),
         'replay_mem2': replay_stats[2].cpu().detach(),
         'random_seed': random_seed,
+        'mus': mus.cpu().detach(),
+        'logsigma': logsigma.cpu().detach(),
         'log_dir': log,
         'cl_acc_dir': acc_log
     }, fout)
@@ -433,6 +445,14 @@ def loc_init_z(locs, prev_labels, latent_dim, dataloader):
     return train_z
 
 
+def loc_init_mu(prev_mu, cur_mu):
+    ata = torch.matmul(prev_mu, prev_mu.t())
+    inv_ata = torch.inverse(ata)
+    proj_mat = torch.matmul(prev_mu.t(), torch.matmul(inv_ata, prev_mu))
+    new_mu = cur_mu - torch.matmul(proj_mat, cur_mu.t()).t()
+    return new_mu
+
+
 def synthesize_features(netG, test_labels, trained_labels, attr, class_stats, n_samples, x_dim, z_dim, replay=False):
     unique_test_labels = np.unique(test_labels)
     unique_trained_labels = np.unique(trained_labels)
@@ -462,15 +482,17 @@ def synthesize_features(netG, test_labels, trained_labels, attr, class_stats, n_
     return gen_feat, torch.from_numpy(gen_label.astype(int)), fix_z
 
 
-def samp_features(trained_labels, feas, n_samples):
+def samp_features(trained_labels, feas, latent_rep, n_samples):
     unique_trained_labels = np.unique(trained_labels)
     nclass = len(unique_trained_labels)
     gen_feat = []
     gen_label = []
+    gen_z = []
     for ii in range(nclass):
         label = unique_trained_labels[ii]
         mask = trained_labels == label
         subset_feas = feas[mask]
+        subset_z = latent_rep[mask]
         subset_labels = trained_labels[mask]
         if subset_feas.shape[0] < n_samples:
             subsamp_idx = np.random.choice(np.arange(np.sum(mask)), subset_feas.shape[0], replace=False)
@@ -478,9 +500,11 @@ def samp_features(trained_labels, feas, n_samples):
             subsamp_idx = np.random.choice(np.arange(np.sum(mask)), n_samples, replace=False)
         gen_feat.append(torch.from_numpy(subset_feas[subsamp_idx]))
         gen_label.append(subset_labels[subsamp_idx])
+        gen_z.append(subset_z[subsamp_idx])
     gen_feat = torch.cat(gen_feat, dim=0)
     gen_label = np.concatenate(gen_label)
-    return gen_feat, torch.from_numpy(gen_label.astype(int))
+    gen_z = torch.cat(gen_z, dim=0)
+    return gen_feat, torch.from_numpy(gen_label.astype(int)), gen_z.detach()
 
 
 def eval_knn(gen_feat, gen_label, test_feats, test_labels, knn):

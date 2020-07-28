@@ -12,14 +12,14 @@ class Encoder(nn.Module):
     def __init__(self, input_dim, inter_dims, hid_dim):
         super(Encoder, self).__init__()
 
-        self.encoder = nn.Sequential(nn.Linear(input_dim, 500),
+        self.encoder = nn.Sequential(nn.Linear(input_dim, 400),
                                      nn.ReLU(True),
-                                     nn.Linear(500, 500),
+                                     nn.Linear(400, 400),
                                      nn.ReLU(True),
-                                     nn.Linear(500, 2000),
+                                     nn.Linear(400, 400),
                                      nn.ReLU(True))
 
-        self.fc = nn.Linear(2000, hid_dim)
+        self.fc = nn.Linear(400, hid_dim)
 
     def forward(self, x):
         e = self.encoder(x)
