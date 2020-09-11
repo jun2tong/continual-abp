@@ -4,6 +4,7 @@ import numpy as np
 import scipy.io as sio
 from sklearn import preprocessing
 import torch
+import pickle
 
 
 def map_label(label, classes):
@@ -14,6 +15,24 @@ def map_label(label, classes):
     return mapped_label
 
 
+def read_pickle(data_path, file_list):
+    data = []
+    targets = []
+    # now load the picked numpy arrays
+    for file_name, checksum in file_list:
+        file_path = f"{data_path}/{file_name}"
+        with open(file_path, 'rb') as f:
+            entry = pickle.load(f, encoding='latin1')
+            data.append(entry['data'])
+            if 'labels' in entry:
+                targets.extend(entry['labels'])
+            else:
+                targets.extend(entry['fine_labels'])
+    data = np.vstack(data).reshape(-1, 3, 32, 32)
+    data = data.transpose((0, 2, 3, 1))  # convert to HWC
+    return data, targets
+
+
 class DATA_LOADER(object):
     def __init__(self, opt):
 
@@ -21,6 +40,12 @@ class DATA_LOADER(object):
             self.read_matimagenet(opt)
         elif opt.dataset.lower() == "mnist":
             self.read_pt(opt)
+        elif opt.dataset.lower() == 'cifar10':
+            self.read_cifar10(opt)
+        elif opt.dataset.lower() == 'cifar10feas':
+            self.read_cifar10_feas(opt)
+        elif opt.dataset.lower() == 'cifar10feas_prepool':
+            self.read_cifar10feas_prepool(opt)
         else:
             self.read_matdataset(opt)
         self.index_in_epoch = 0
@@ -86,6 +111,59 @@ class DATA_LOADER(object):
         self.ntrain_class = 10
         self.train_label = label.long()
         self.test_seen_label = test_label.long()
+
+    def read_cifar10(self, opt):
+        train_list = [
+            ['data_batch_1', 'c99cafc152244af753f735de768cd75f'],
+            ['data_batch_2', 'd4bba439e000b95fd0a9bffe97cbabec'],
+            ['data_batch_3', '54ebc095f3ab1f0389bbae665268c751'],
+            ['data_batch_4', '634d18415352ddfa80567beed471001a'],
+            ['data_batch_5', '482c414d41f54cd18b22e5b47cb7c3cb'],
+        ]
+        test_list = [
+            ['test_batch', '40351d587109b95175f43aff81a1287e'],
+        ]
+        train_data, train_targets = read_pickle(f"{opt.dataroot}/cifar-10-batches-py/", train_list)
+        test_data, test_targets = read_pickle(f"{opt.dataroot}/cifar-10-batches-py/", test_list)
+        self.attribute = torch.randn(10, 10).numpy()
+        self.train_att = torch.randn(10, 10).numpy()
+        _train_feature = train_data.astype(np.float) / 255.
+        _test_feature = test_data.astype(np.float) / 255.
+        self.train_feature = torch.from_numpy(_train_feature).float().permute(0,3,1,2)
+        self.test_seen_feature = torch.from_numpy(_test_feature).float().permute(0,3,1,2)
+        self.ntrain_class = 10
+        self.train_label = torch.tensor(train_targets).long()
+        self.test_seen_label = torch.tensor(test_targets).long()
+
+    def read_cifar10_feas(self, opt):
+        checkpoint = torch.load(f"{opt.dataroot}/cifar-10-batches-py/resnet56_feas.tar")
+        x_train = checkpoint["x_train"].numpy()
+        x_valid = checkpoint["x_valid"].numpy()
+        self.train_label = checkpoint['y_train']  # long tensor
+        self.test_seen_label = checkpoint["y_valid"]  # long tensor
+
+        scaler = preprocessing.MinMaxScaler()
+        _train_feature = scaler.fit_transform(x_train)
+        _test_seen_feature = scaler.transform(x_valid)
+        self.train_feature = torch.from_numpy(_train_feature)
+        self.test_seen_feature = torch.from_numpy(_test_seen_feature)
+        self.ntrain_class = 10
+        self.attribute = torch.randn(10, 10).numpy()
+
+    def read_cifar10feas_prepool(self, opt):
+        checkpoint = torch.load(f"{opt.dataroot}/cifar10_midfeas.tar")
+        x_train = checkpoint["x_train"].numpy()
+        x_valid = checkpoint["x_valid"].numpy()
+        self.train_label = checkpoint['y_train']  # long tensor
+        self.test_seen_label = checkpoint["y_valid"]  # long tensor
+
+        scaler = preprocessing.MinMaxScaler()
+        _train_feature = scaler.fit_transform(x_train)
+        _test_seen_feature = scaler.transform(x_valid)
+        self.train_feature = torch.from_numpy(_train_feature)
+        self.test_seen_feature = torch.from_numpy(_test_seen_feature)
+        self.ntrain_class = 10
+        self.attribute = torch.randn(10, 10).numpy()
 
     def read_matdataset(self, opt):
         matcontent = sio.loadmat(opt.dataroot + "/" + opt.dataset + "/" + opt.image_embedding + ".mat")
@@ -175,6 +253,53 @@ class FeatDataLayer(object):
             # minibatch_label = np.array([self.label[i] for i in db_inds])
         minibatch_feat = self.feat_data[db_inds]
         minibatch_label = self.label[db_inds]
+        blobs = {'data': minibatch_feat, 'labels': minibatch_label, 'idx': db_inds}
+        return blobs
+
+    def get_whole_data(self):
+        blobs = {'data': self.feat_data, 'labels': self.label}
+        return blobs
+
+
+class StreamDataLayer(object):
+    def __init__(self, label, feat_data,  mini_batchsize):
+        """Set the roidb to be used by this layer during training."""
+        assert len(label) == feat_data.shape[0]
+
+        sort_res = torch.sort(label)
+
+        self.mini_batchsize = mini_batchsize
+        self.feat_data = feat_data[sort_res[1]]
+        self.label = label[sort_res[1]]
+        # self.feat_data = feat_data
+        # self.label = label
+        self.num_obs = len(label)
+        self.cur = 0
+        self.iter = 0
+
+    def has_next_batch(self):
+        if self.cur < self.num_obs:
+            return True
+        else:
+            return False
+
+    def get_iteration(self):
+        return self.iter
+
+    def get_cur_idx(self):
+        return self.cur
+
+    def get_batch_data(self):
+        if self.cur + self.mini_batchsize >= self.num_obs:
+            db_inds = np.arange(self.cur, self.num_obs)
+            self.cur = self.num_obs
+        else:
+            db_inds = np.arange(self.cur, self.cur+self.mini_batchsize)
+            self.cur += self.mini_batchsize
+
+        minibatch_feat = self.feat_data[db_inds]
+        minibatch_label = self.label[db_inds]
+        self.iter += 1
         blobs = {'data': minibatch_feat, 'labels': minibatch_label, 'idx': db_inds}
         return blobs
 

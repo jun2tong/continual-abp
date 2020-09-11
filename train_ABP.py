@@ -103,7 +103,6 @@ def train():
     opt.X_dim = dataset.feature_dim
     opt.Z_dim = opt.latent_dim
     opt.y_dim = dataset.ntrain_class
-
     # Continual Learning dataset split
     taskset = dataset.ntrain_class // opt.task_split_num
     task_boundary = [ii for ii in range(0, dataset.ntrain_class+1, taskset)]

@@ -8,6 +8,37 @@ import itertools
 from sklearn.mixture import GaussianMixture
 
 
+class CifarEncoder(nn.Module):
+    def __init__(self, latent_dim):
+        super(CifarEncoder, self).__init__()
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(32)
+        self.conv3 = nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(32)
+        self.conv4 = nn.Conv2d(32, 16, kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn4 = nn.BatchNorm2d(16)
+
+        self.fc1 = nn.Linear(8 * 8 * 16, latent_dim)
+        self.fc_bn1 = nn.BatchNorm1d(latent_dim)
+        self.fc21 = nn.Linear(latent_dim, latent_dim)
+        self.relu = nn.ReLU()
+
+    def encode(self, x):
+        conv1 = self.relu(self.bn1(self.conv1(x)))
+        conv2 = self.relu(self.bn2(self.conv2(conv1)))
+        conv3 = self.relu(self.bn3(self.conv3(conv2)))
+        conv4 = self.relu(self.bn4(self.conv4(conv3))).view(-1, 8 * 8 * 16)
+
+        fc1 = self.relu(self.fc_bn1(self.fc1(conv4)))
+        return self.fc21(fc1)
+
+    def forward(self, x):
+        out = self.encode(x)
+        return out
+
+
 class Encoder(nn.Module):
     def __init__(self, input_dim, inter_dims, hid_dim):
         super(Encoder, self).__init__()
@@ -40,11 +71,12 @@ class Decoder(nn.Module):
         return x_pro
 
 
-def pre_train_gmm(x_dim, z_dim, gh_dim, dataloader, nclusters, nepoch, device, decoder=None):
+def pre_train_gmm(x_dim, z_dim, gh_dim, dataloader, nclusters, nepoch, device, decoder=None, dataname='mnist'):
     recon_loss_fcn = nn.MSELoss()
     # cls_loss_fcn = nn.NLLLoss(reduction="mean")
-
     encoder = Encoder(x_dim, gh_dim, z_dim).to(device)
+    if dataname.lower() == "cifar10":
+        encoder = CifarEncoder(z_dim).to(device)
     if decoder is None:
         decoder = Decoder(x_dim, gh_dim, z_dim).to(device)
 
