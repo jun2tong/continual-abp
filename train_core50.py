@@ -19,7 +19,7 @@ from collections import Counter
 
 from gen_model import FeaturesGenerator
 from classifier import eval_model
-from dataset_GBU import FeatDataLayer, DATA_LOADER
+from dataset_GBU import FeatDataLayer, CORE50
 
 
 parser = argparse.ArgumentParser()
@@ -76,14 +76,10 @@ print(device)
 
 
 def train():
-    dataset = DATA_LOADER(opt)
-    opt.X_dim = dataset.feature_dim
+    # dataset = DATA_LOADER(opt)
+    opt.X_dim = 2048
     opt.Z_dim = opt.latent_dim
-    num_k = 10
-    # Continual Learning dataset split
-    taskset = dataset.ntrain_class // opt.task_split_num
-    task_boundary = [ii for ii in range(0, dataset.ntrain_class+1, taskset)]
-    start_idx = task_boundary.pop(0)
+    num_k = 50
 
     result_knn = Result()
     netG = FeaturesGenerator(opt.Z_dim, num_k, opt.X_dim).to(device)
@@ -94,7 +90,6 @@ def train():
     os.makedirs(out_dir, exist_ok=True)
     print("The output dictionary is {}".format(out_dir))
 
-    # log_dir = out_dir + '/log_{}.txt'.format(opt.dataset)
     it = 1
     while os.path.isfile(f"{out_dir}/log_it{it:02d}.txt"):
         it += 1
@@ -126,31 +121,24 @@ def train():
     replay_stats = None
     all_task_dataloader = {}
     all_task_testdata = {}
-    log_print(f"Task Boundary: {task_boundary} \n", log_dir)
-    for task_idx, tb in enumerate(task_boundary):
 
-        task_mask_1 = dataset.train_label >= start_idx
-        task_mask_2 = dataset.train_label < tb
-        task_mask = task_mask_1 * task_mask_2
+    for task_idx in range(9):
+        log_print(f"Task: {task_idx} \n", log_dir)
+        dataset = CORE50(task_idx)
+
         if replay_mem is not None:
-            train_label = torch.cat([replay_mem[1], dataset.train_label[task_mask]], dim=0)
-            train_feas = torch.cat([replay_mem[0], dataset.train_feature[task_mask]], dim=0)
+            train_label = torch.cat([replay_mem[1], dataset.train_label], dim=0)
+            train_feas = torch.cat([replay_mem[0], dataset.train_feature], dim=0)
         else:
-            train_label = dataset.train_label[task_mask]
-            train_feas = dataset.train_feature[task_mask]
+            train_label = dataset.train_label
+            train_feas = dataset.train_feature
         log_print(f"train X: {train_feas.shape}", log_dir)
         log_print(f"train Y : {train_label.shape}", log_dir)
-        # log_print(f"valid X: {valid_feas.shape}", log_dir)
-        # log_print(f"valid Y: {valid_label.shape}", log_dir)
 
         task_dataloader = FeatDataLayer(train_label.numpy(), train_feas.numpy(), opt.batchsize)
         all_task_dataloader[task_idx] = task_dataloader
 
-        task_mask_1 = dataset.test_seen_label >= start_idx
-        task_mask_2 = dataset.test_seen_label < tb
-        task_mask = task_mask_1 * task_mask_2
-        all_task_testdata[task_idx] = (dataset.test_seen_feature[task_mask], dataset.test_seen_label[task_mask])
-        start_idx = tb
+        all_task_testdata[task_idx] = (dataset.test_seen_feature, dataset.test_seen_label)
 
         if opt.resume and task_idx < 1:
             if os.path.isfile(opt.resume):
@@ -179,7 +167,6 @@ def train():
                                        weight_decay=opt.weight_decay, betas=(0.5, 0.999))
         optimizer_g.add_param_group({"params": [mus, logsigma]})
         total_niter = int(task_dataloader.num_obs/opt.batchsize) * opt.nepoch
-        num_active = 10
         for it in range(start_step, total_niter+1):
             blobs = task_dataloader.forward()
             feat_data = blobs['data']  # image data
@@ -200,7 +187,7 @@ def train():
                 recon_loss = get_recon_loss(recon_x, x_mb, opt.sigma)  # Reconstruction Loss
 
                 # log_pdfs = get_prior_loss_mm(z_mb, mus, logsigma)
-                log_pdfs = get_prior_loss_mm(netG, z_mb, x_mb, num_active)
+                log_pdfs = get_prior_loss_mm(netG, z_mb, x_mb, num_k)
                 entropy_loss = get_entropy_loss(log_pdfs, one_hot_y.to(device))  # Entropy Loss
 
                 prior_loss = get_prior_loss(z_mb, mus[y_mb], logsigma[y_mb])
@@ -219,7 +206,6 @@ def train():
                     recon_loss = get_recon_loss(recon_x, x_mb, opt.sigma)
 
                     # log_pdfs = get_prior_loss_mm(z_mb, mus, logsigma)
-                    # log_pdfs = get_prior_loss_mm(netG, z_mb, x_mb, num_active)
                     # entropy_loss = get_entropy_loss(log_pdfs, one_hot_y.to(device))
 
                     prior_loss = get_prior_loss(z_mb, mus[y_mb], logsigma[y_mb])
@@ -247,7 +233,7 @@ def train():
                 replay_mem = synthesize_features(netG, opt.nSample, n_active, num_k, opt.X_dim, opt.Z_dim)
                 eval_acc = eval_model(replay_mem[0], replay_mem[1],
                                       all_task_testdata[task_idx][0], all_task_testdata[task_idx][1],
-                                      opt.classifier_lr, device)
+                                      opt.classifier_lr, device, 50)
                 log_text = f'Eval-[{it}/{total_niter}]; loss: {batch_loss :.4f}; accuracy: {eval_acc: .4f}'
                 log_print(log_text, log_dir)
                 netG.train()
@@ -261,7 +247,7 @@ def train():
             replay_mem = synthesize_features(netG, opt.nSample, n_active, num_k, opt.X_dim, opt.Z_dim)
             eval_acc = eval_model(replay_mem[0], replay_mem[1],
                                   all_task_testdata[task_idx][0], all_task_testdata[task_idx][1],
-                                  opt.classifier_lr, device)
+                                  opt.classifier_lr, device, 50)
             test_acc.append(eval_acc)
         result_knn.update_task_acc(test_acc)
         print(f"CL Task Accuracy: {test_acc}")
@@ -271,21 +257,13 @@ def train():
             forget_rate /= result_knn.task_acc[0][0]
             print(f"CL Forgetting: {np.abs(forget_rate)*100: .4f}%")
 
-        if opt.save_task and task_idx < 1:
-            save_model(it, netG, train_z, replay_mem, opt.manualSeed, log_dir, cl_acc_dir, mus, logsigma,
+        if opt.save_task:
+            save_model(task_idx, netG, train_z, replay_mem, opt.manualSeed, log_dir, cl_acc_dir, mus, logsigma,
                        f"{out_dir}/train_task_{task_idx+1}.tar")
             print(f'Save model to {out_dir}/train_task_{task_idx+1}.tar')
         print(f"============ End of task {task_idx + 1} ============\n")
         netG.train()
     result_knn.log_results(cl_acc_dir)
-
-
-def show(img, num_iter):
-    npimg = img.numpy()
-    plt.figure(figsize=(15,7))
-    plt.imshow(np.transpose(npimg, (1,2,0)), interpolation='nearest')
-    plt.savefig(f"figures/iter-{num_iter}.png")
-    plt.close()
 
 
 def log_print(s, log, print_str=True):
@@ -319,6 +297,7 @@ def get_prior_loss(z, mus, logsigma):
     log_pdf = 0.5 * torch.sum(np.log(2.0 * np.pi) + torch.pow(z, 2))
     return log_pdf
 
+
 # def get_prior_loss_mm(z, mus, logsigma):
 #     dist_term = torch.pow(z.unsqueeze(1) - mus.unsqueeze(0), 2) / torch.exp(logsigma.unsqueeze(0))
 #     log_pdf = -0.5 * torch.sum(np.log(2.0 * np.pi) + logsigma.unsqueeze(0) + dist_term, dim=-1)  # (B, nc)
@@ -328,8 +307,8 @@ def get_prior_loss(z, mus, logsigma):
 def get_prior_loss_mm(net, z, x, num_active):
     all_dist = []
     for ii in range(num_active):
-        one_hot_y = torch.eye(10)[ii]
-        one_hot_y = one_hot_y.repeat(x.size(0),1).to(device)
+        one_hot_y = torch.eye(50)[ii]
+        one_hot_y = one_hot_y.repeat(x.size(0), 1).to(device)
         recon_x = net(z, one_hot_y)
         dist = -1.*torch.sum(torch.pow(recon_x - x, 2), dim=-1)
         all_dist.append(dist.unsqueeze(1))
@@ -344,7 +323,7 @@ def get_entropy_loss(logits, probs):
 
 def save_model(it, netG, latent_state, replay_mem, random_seed, log, acc_log, mus, logsigma, fout):
     torch.save({
-        'it': it + 1,
+        'task_idx': it,
         'state_dict_G': netG.state_dict(),
         'train_z_state': latent_state.cpu().detach(),
         'replay_mem0': replay_mem[0].cpu().detach(),
@@ -356,27 +335,6 @@ def save_model(it, netG, latent_state, replay_mem, random_seed, log, acc_log, mu
         'log_dir': log,
         'cl_acc_dir': acc_log
     }, fout)
-
-
-def get_class_stats(latent, labels):
-    assert latent.size(0) == labels.shape[0]
-    unique_label = np.unique(labels)
-    train_stats = {}
-    # train_loc = torch.zeros(len(unique_label), latent.size(1))
-    for ii, label in enumerate(unique_label):
-        mask = labels == label
-        z_samp = latent[mask]
-        var, loc = torch.var_mean(z_samp, dim=0)
-        train_stats[label] = (loc, var)
-    return train_stats
-
-
-def get_class_stats_imp(locs, sigmas, labels):
-    unique_label = np.unique(labels)
-    train_stats = {}
-    for ii, label in enumerate(unique_label):
-        train_stats[label] = (locs[label].detach(), sigmas[label].detach())
-    return train_stats
 
 
 def synthesize_features(netG, n_samples, n_active_comp, num_k, x_dim, latent_dim):

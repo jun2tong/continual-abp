@@ -38,9 +38,9 @@ class FeaturesGenerator(torch.nn.Module):
     def __init__(self, latent_dim, num_k, out_dim):
         self.num_nodes = latent_dim + num_k
         super(FeaturesGenerator, self).__init__()
-        self.main = nn.Sequential(nn.Linear(self.num_nodes, 512),
+        self.main = nn.Sequential(nn.Linear(self.num_nodes, 1024),
                                   nn.LeakyReLU(0.2, True),
-                                  nn.Linear(512, out_dim),
+                                  nn.Linear(1024, out_dim),
                                   # nn.ReLU(True),
                                   nn.Sigmoid()
                                   )

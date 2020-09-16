@@ -211,6 +211,24 @@ class DATA_LOADER(object):
         self.train_att = self.attribute[self.seenclasses].numpy()
 
 
+class CORE50(object):
+    def __init__(self, task_id):
+        checkpoint = torch.load(f"data/core50/core50feas_task{task_id}.tar")
+        x_train = checkpoint["x_train"].numpy()
+        self.train_label = checkpoint['y_train'].long()
+        checkpoint = torch.load(f"data/core50/core50feas_test_task{task_id}.tar")
+        self.test_seen_label = checkpoint["y_valid"].long()
+        x_valid = checkpoint["x_valid"].numpy()
+
+        scaler = preprocessing.MinMaxScaler()
+        _train_feature = scaler.fit_transform(x_train)
+        _test_seen_feature = scaler.transform(x_valid)
+        self.train_feature = torch.from_numpy(_train_feature)
+        self.test_seen_feature = torch.from_numpy(_test_seen_feature)
+        self.ntrain_class = 10
+        self.attribute = torch.randn(10, 10).numpy()
+
+
 class FeatDataLayer(object):
     def __init__(self, label, feat_data,  mini_batchsize):
         """Set the roidb to be used by this layer during training."""
@@ -271,8 +289,6 @@ class StreamDataLayer(object):
         self.mini_batchsize = mini_batchsize
         self.feat_data = feat_data[sort_res[1]]
         self.label = label[sort_res[1]]
-        # self.feat_data = feat_data
-        # self.label = label
         self.num_obs = len(label)
         self.cur = 0
         self.iter = 0

@@ -104,9 +104,9 @@ def eval_model_cls(net, feats, labels, nsamples, task_stats, latent_dim, sigma, 
     return acc*100
 
 
-def eval_model(feats, labels, valid_feas, valid_label, lr_rate, device):
+def eval_model(feats, labels, valid_feas, valid_label, lr_rate, device, num_classes=10):
     mb_size = 64
-    linear_cls = LinearCLS(feats.size(1), 10).to(device)
+    linear_cls = LinearCLS(feats.size(1), num_classes).to(device)
     optimizer_cls = torch.optim.Adam(linear_cls.parameters(), lr=lr_rate, betas=(0.5, 0.999))
     cls_criterion = nn.NLLLoss()
 

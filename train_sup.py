@@ -15,9 +15,10 @@ from time import gmtime, strftime
 from sklearn.metrics.pairwise import cosine_similarity
 from collections import Counter
 
-from classifier import eval_batch, eval_model
-from dataset_GBU import FeatDataLayer, DATA_LOADER, StreamDataLayer
-from pre_train import pre_train_gmm
+from gen_model import FeaturesGenerator
+from classifier import eval_model
+from dataset_GBU import StreamDataLayer, DATA_LOADER, FeatDataLayer
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--repeat', type=int, default=1, help='number of repeats for experiment')
@@ -73,25 +74,6 @@ print(json.dumps(vars(opt), indent=4, separators=(',', ': ')))
 print(device)
 
 
-# our generator
-class ConditionalGenerator(nn.Module):
-    def __init__(self, opt, num_k):
-        super(ConditionalGenerator, self).__init__()
-        self.main = nn.Sequential(nn.Linear(opt.Z_dim + num_k, 400),
-                                  nn.ReLU(True),
-                                  nn.Linear(400, 400),
-                                  nn.ReLU(True),
-                                  nn.Linear(400, 400),
-                                  nn.ReLU(True),
-                                  nn.Linear(400, opt.X_dim),
-                                  nn.Sigmoid())
-
-    def forward(self, z, c):
-        in_vec = torch.cat([z, c], dim=1)
-        output = self.main(in_vec)
-        return output
-
-
 def init_log():
     out_dir = f'out/stream/{opt.dataset}/nreplay-{opt.nSample_replay}_sigma-{opt.sigma}_langevin_s-{opt.langevin_s}_' \
               f'step-{opt.langevin_step}_nepoch-{opt.nepoch}'
@@ -119,208 +101,153 @@ def train():
     - One component for one class.
     """
     dataset = DATA_LOADER(opt)
-    opt.C_dim = dataset.att_dim
     opt.X_dim = dataset.feature_dim
     opt.Z_dim = opt.latent_dim
-    opt.y_dim = dataset.ntrain_class
+    num_k = 10
 
-    log_dir, cl_acc_dir = init_log()
+    # log_dir, cl_acc_dir = init_log()
     num_limit_component = 10
-    num_active_component = 10
     energy_thres = 3.
-    buffer_limit = 100
+    buffer_limit = 10
     cur_buffer_size = 0
-    init_new_comp = True
     seen_label = []
     poor_data_buffer = []
     poor_data_labels = []
-    poor_data_pi = []
     poor_data_z = []
     data_count = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0, 9: 0}
 
     result_metric = Result()
     ### Initialized trainable and inferable params here
-    netG = ConditionalGenerator(opt, num_limit_component).to(device)
+    netG = FeaturesGenerator(opt.Z_dim, num_k, opt.X_dim).to(device)
     netG.apply(weights_init)
     print(netG)
-    mu_c = torch.randn(num_limit_component, opt.Z_dim).float().to(device)
-    logsigma_c = torch.zeros(num_limit_component, opt.Z_dim).float().to(device)
+    mus = torch.randn(num_limit_component, opt.Z_dim).float().to(device)
+    logsigma = torch.zeros(num_limit_component, opt.Z_dim).float().to(device)
 
     data_loader = StreamDataLayer(dataset.train_label, dataset.train_feature, 64)
-    optimizerG = optim.Adam(netG.parameters(), lr=opt.lr, weight_decay=opt.weight_decay)
+    optimizer_g = optim.Adam(netG.parameters(), lr=opt.lr, weight_decay=opt.weight_decay)
     replay_stats = None
     while data_loader.has_next_batch():
         ### Get current stream of data
         cur_blob = data_loader.get_batch_data()
         cur_batch_feas = cur_blob["data"]
         cur_batch_labels = cur_blob["labels"]
+        Z = torch.randn(cur_batch_feas.size(0), opt.Z_dim)
+        Z = Z.float().to(device)
         ### Identify new component
-        batch_labels = torch.unique(cur_batch_labels)
-        for alab in batch_labels:
-            if alab.item() not in seen_label:
-                seen_label += [alab.item()]
-                init_new_comp = True
-                # num_active_component += 1
-                data_count[alab.item()] = 0
-            else:
-                init_new_comp = False
+        # batch_labels = torch.unique(cur_batch_labels)
+        # for alab in batch_labels:
+        #     if alab.item() not in seen_label:
+        #         seen_label += [alab.item()]
+        #         data_count[alab.item()] = 0
+        #     else:
+        #         init_new_comp = False
 
         ### Update count
-        for alab in seen_label:
-            mask = cur_batch_labels == alab
-            count = torch.sum(mask)
-            data_count[alab] += count.item()
+        # for alab in seen_label:
+        #     mask = cur_batch_labels == alab
+        #     count = torch.sum(mask)
+        #     data_count[alab] += count.item()
 
-        ### Identify poorly-explained data
-        task_stats = get_class_stats_imp(mu_c, logsigma_c, np.arange(10))
-        energy_level = eval_batch(netG, cur_batch_feas, task_stats, opt.Z_dim, 128, opt.sigma,
-                                  10, num_limit_component, device)
-        train_z = loc_init_z(task_stats, seen_label, opt.Z_dim, cur_batch_labels)
-        if (data_loader.get_iteration() % 10) == 0:
-            print(f"avg energy level: {energy_level.mean()}")
-        mask = energy_level >= energy_thres
-        poor_data_buffer.append(cur_batch_feas[mask])
-        poor_data_z.append(train_z[mask])
-        poor_data_labels.append(cur_batch_labels[mask])
-        # poor_data_pi.append(prior_weights[mask])
-        cur_buffer_size += torch.sum(mask)
+        ### TODO: Identify poorly-explained data
+        poor_data_buffer.append(cur_batch_feas)
+        poor_data_z.append(Z)
+        poor_data_labels.append(cur_batch_labels)
+        cur_buffer_size += 100
 
         ### Train model on data buffer
         if cur_buffer_size >= buffer_limit:
             print("============= Training poor data buffer. ============")
-            train_x = torch.cat(poor_data_buffer, dim=0).to(device)
-            train_y = torch.cat(poor_data_labels, dim=0).to(device)
-            Z = torch.cat(poor_data_z, dim=0).to(device)
+            train_x = torch.cat(poor_data_buffer, dim=0)
+            train_y = torch.cat(poor_data_labels, dim=0)
+            train_z = torch.cat(poor_data_z, dim=0)
             if replay_stats is not None:
                 train_x = torch.cat([replay_stats[0], train_x], dim=0)
-                train_y = torch.cat([replay_stats[1].to(device), train_y], dim=0)
-                Z = torch.cat([replay_stats[2].to(device), Z], dim=0)
-            prior_weights = torch.ones(train_x.size(0), 10) / len(seen_label)
-            prior_weights = prior_weights.float().to(device)
-
-            # task_mu = mu_c[:len(seen_label)]
-            task_mu = mu_c
-            task_mu.requires_grad_()
-            # task_logsigma = logsigma_c[:len(seen_label)]
-            task_logsigma = logsigma_c
-            task_logsigma.requires_grad_()
-
+                train_y = torch.cat([replay_stats[1], train_y], dim=0)
+                train_z = torch.cat([replay_stats[2], train_z], dim=0)
             print(f"train_x shape: {train_x.size()}")
             print(f"train_y shape: {train_y.size()}")
             print(f"Seen labels: {seen_label}")
-            train_dataloader = FeatDataLayer(train_y, train_x, 64)
-            total_iter = train_dataloader.num_obs // 64 * opt.nepoch*len(seen_label)
+            train_dataloader = FeatDataLayer(train_y.numpy(), train_x.numpy(), 64)
+            total_iter = train_dataloader.num_obs // 64 * opt.nepoch
             ### EM_STEP
             for it in range(total_iter):
                 mb_blob = train_dataloader.forward()
-                x_mb = mb_blob["data"]
+                x_mb = torch.from_numpy(mb_blob["data"]).to(device)
                 idx_mb = mb_blob["idx"]
-                y_mb = mb_blob["labels"]
-                z_mb = Z[idx_mb].to(device)
+                y_mb = torch.from_numpy(mb_blob["labels"]).long()
+                z_mb = train_z[idx_mb].to(device)
                 z_mb.requires_grad_()
-                pi_weights = prior_weights[idx_mb]
-                optimizer_z = torch.optim.Adam([z_mb, task_mu, task_logsigma], lr=opt.lr, weight_decay=opt.weight_decay)
-                for em_step in range(1):
-                    # infer z
-                    netG.train()
+
+                optimizer_z = torch.optim.Adam([z_mb], lr=opt.lr, weight_decay=opt.weight_decay)
+                scheduler_z = optim.lr_scheduler.StepLR(optimizer_z, step_size=5, gamma=0.97)
+                batch_loss = 0
+                for em_step in range(2):
+                    optimizer_g.zero_grad()
+                    one_hot_y = torch.eye(num_k)[y_mb]
+                    recon_x = netG(z_mb, one_hot_y.to(device))
+                    recon_loss = get_recon_loss(recon_x, x_mb, opt.sigma)  # Reconstruction Loss
+
+                    # log_pdfs = get_prior_loss_mm(z_mb, mus, logsigma)
+                    log_pdfs = get_prior_loss_mm(netG, z_mb, x_mb, num_k)
+                    entropy_loss = get_entropy_loss(log_pdfs, one_hot_y.to(device))  # Entropy Loss
+
+                    prior_loss = get_prior_loss(z_mb, mus[y_mb], logsigma[y_mb])
+
+                    gloss = recon_loss + prior_loss + entropy_loss
+                    gloss /= x_mb.size(0)
+                    gloss.backward()
+                    optimizer_g.step()
+                    srmc_loss = 0
+
                     for _ in range(opt.langevin_step):
-                        U_tau = torch.ones(z_mb.size()).normal_(0, opt.sigma_U).float().to(device)
-                        pred = netG(z_mb, pi_weights)
-                        recon_loss = get_recon_loss(pred, x_mb, opt.sigma)
-                        entropy_loss, class_pred_prob = get_entropy_loss(z_mb, task_mu, task_logsigma, y_mb)
-                        # entropy_loss, class_pred_prob = get_weights(z_mb, x_mb, pi_weights, y_mb,
-                        #                                             netG, opt.sigma, num_active_component)
-                        # prior_loss = get_prior_loss_mm(z_mb, task_mu, task_logsigma, class_pred_prob)
-                        prior_loss = get_prior_loss(z_mb, task_mu, task_logsigma, class_pred_prob, True)
-                        loss = recon_loss + prior_loss + entropy_loss
-                        scaled_loss = (opt.langevin_s ** 2) * loss * 0.5
                         optimizer_z.zero_grad()
-                        scaled_loss.backward()
-                        # torch.nn.utils.clip_grad_norm_([Z], 5.)
-                        # torch.nn.utils.clip_grad_norm_([task_mu, task_logsigma], 5.)
-                        optimizer_z.step()
-                        z_mb.data += opt.langevin_s * U_tau
-                        _, class_pred_prob = get_entropy_loss(z_mb, task_mu, task_logsigma, y_mb)
-                        # _, class_pred_prob = get_weights(z_mb, x_mb, pi_weights, y_mb,
-                        #                                  netG, opt.sigma, len(seen_label))
-                        pi_weights = class_pred_prob.detach()
-                        optimizer_z.zero_grad()
+                        u_tau = torch.randn(z_mb.size(0), opt.Z_dim).float().to(device)
 
-                    # update w
-                    for _ in range(1):
-                        pred = netG(z_mb, pi_weights)
-                        recon_loss = get_recon_loss(pred, x_mb, opt.sigma)
-                        entropy_loss, class_pred_prob = get_entropy_loss(z_mb, task_mu, task_logsigma, y_mb)
-                        # entropy_loss, class_pred_prob = get_weights(z_mb, x_mb, pi_weights, y_mb,
-                        #                                             netG, opt.sigma, num_active_component)
-                        # prior_loss = get_prior_loss_mm(z_mb, task_mu, task_logsigma, class_pred_prob)
-                        prior_loss = get_prior_loss(z_mb, task_mu, task_logsigma, class_pred_prob, True)
-                        loss = recon_loss + prior_loss + entropy_loss
-                        # loss = recon_loss + prior_loss
-                        optimizerG.zero_grad()
+                        one_hot_y = torch.eye(num_k)[y_mb]
+                        recon_x = netG(z_mb, one_hot_y.to(device))
+                        recon_loss = get_recon_loss(recon_x, x_mb, opt.sigma)
+
+                        # log_pdfs = get_prior_loss_mm(z_mb, mus, logsigma)
+                        # entropy_loss = get_entropy_loss(log_pdfs, one_hot_y.to(device))
+
+                        prior_loss = get_prior_loss(z_mb, mus[y_mb], logsigma[y_mb])
+
+                        loss = recon_loss + prior_loss
+                        loss /= x_mb.size(0)
+                        loss = opt.langevin_s ** 2 / 2 * loss
                         loss.backward()
-                        # torch.nn.utils.clip_grad_norm_(netG.parameters(), 5.)
-                        optimizerG.step()
-                        _, class_pred_prob = get_entropy_loss(z_mb, task_mu, task_logsigma, y_mb)
-                        # _, class_pred_prob = get_weights(z_mb, x_mb, pi_weights, y_mb,
-                        #                                  netG, opt.sigma, len(seen_label))
-                        pi_weights = class_pred_prob.detach()
-                        optimizerG.zero_grad()
+                        optimizer_z.step()
+                        z_mb.data += u_tau * opt.langevin_s
+                        srmc_loss += loss.detach()
+                        scheduler_z.step()
 
-                        if ((it+1) % 5) == 0:
-                            # TODO: try evaluate on the train_x
-                            class_pred = torch.argmax(class_pred_prob, dim=1)
-                            corr = torch.sum(class_pred.eq(y_mb))
-                            acc = 100.*corr / y_mb.size(0)
-                            print(f"inner iter {it+1}/{total_iter}, loss: {loss:.4f}, acc: {acc:.4f}")
+                    train_z[idx_mb,] = z_mb.data
+                    batch_loss += (srmc_loss / opt.langevin_step) + gloss.detach()
+                batch_loss /= 2.
 
-                Z[idx_mb] = z_mb.data
-                prior_weights[idx_mb] = pi_weights.data
             ### Clear buffer after training
             cur_buffer_size = 0
             poor_data_z = []
             poor_data_labels = []
             poor_data_buffer = []
-            # poor_data_pi = []
-            # mu_c[:len(seen_label)] = task_mu.data
-            # logsigma_c[:len(seen_label)] = task_logsigma.data
-            mu_c = task_mu.data
-            logsigma_c = task_logsigma.data
+
             ### Generate data from trained clusters
             print("Generate image")
-            task_stats = get_class_stats(Z, train_y.cpu())
-            if len(seen_label) > 1:
-                prior_pi = torch.tensor([data_count[ii] for ii in range(len(seen_label)-1)]).float().to(device)
-                init_new_comp = False
-            else:
-                prior_pi = torch.tensor([data_count[ii] for ii in range(len(seen_label))]).float().to(device)
-            prior_pi = prior_pi / torch.sum(prior_pi)
-            replay_stats = synthesize_features(netG, opt.Z_dim, prior_pi, 100, task_stats)
+            n_active = len(np.unique(train_dataloader.label))
+            replay_stats = synthesize_features(netG, opt.nSample, n_active, num_k, opt.X_dim, opt.Z_dim)
             print("============= Done Training poor data buffer. ============\n")
 
         ### Evaluation
         if data_loader.get_cur_idx() % 640 == 0:
-            valid_data = []
-            valid_labels = []
-            for alab in seen_label:
-                mask = dataset.train_label == alab
-                valid_data.append(dataset.train_feature[mask])
-                valid_labels.append(dataset.train_label[mask])
-            valid_labels = torch.cat(valid_labels, dim=0)
-            valid_data = torch.cat(valid_data, dim=0)
-            prior_pi = torch.tensor([data_count[ii] for ii in range(len(seen_label))]).float().to(device)
-            prior_pi = prior_pi / torch.sum(prior_pi)
-            with torch.no_grad():
-                # TODO: check if can use mu_c
-                # task_stats = get_class_stats(Z, train_y.cpu())
-                task_stats = get_class_stats_imp(mu_c, logsigma_c, np.arange(len(seen_label)))
-                acc = eval_model(netG, valid_data, valid_labels, 128, prior_pi, len(seen_label), opt.Z_dim,
-                                 opt.sigma, task_stats, device)
-            result_metric.update(1, acc)
-            print(f"Iter {data_loader.get_iteration()} Accuracy: {acc: .2f}%")
-        netG.train()
-        print_statement = False
-    # result_metric.log_results(cl_acc_dir)
+            netG.eval()
+            eval_acc = eval_model(replay_stats[0], replay_stats[1],
+                                  dataset.test_seen_feature, dataset.test_seen_label,
+                                  opt.classifier_lr, device, 10)
+
+            result_metric.update(1, eval_acc)
+            print(f"Iter {data_loader.get_iteration()} Accuracy: {eval_acc: .2f}%")
+            netG.train()
 
 
 def log_print(s, log, print_str=True):
@@ -345,71 +272,36 @@ def get_recon_loss(pred, x, sigma):
     return recon_loss
 
 
-def get_prior_loss(z, mus, log_sigma, class_prob, logits=False):
-    # TODO: include weights calculation.
-    pi_const = np.log(2.0 * np.pi)
-    labels = class_prob
-    if logits:
-        labels = torch.argmax(class_prob, dim=1).detach()
-    var_term = log_sigma[labels]
-    dist_term = torch.pow(z - mus[labels], 2) / torch.exp(log_sigma[labels])
-    dist_term = torch.sum(dist_term + var_term)
-    loss = 0.5 * (pi_const + dist_term)
-    return loss
+def get_prior_loss(z, mus, logsigma):
+    log_pdf = 0.5 * torch.sum(np.log(2.0 * np.pi) + torch.pow(z, 2))
+    return log_pdf
 
 
-def get_prior_loss_mm(z, mus, log_sigma, class_prob):
-    """
-    :param z: (B, z_dim)
-    :param mus: (num_component, z_dim)
-    :param log_sigma: (num_component, z_dim)
-    :param class_prob: (B, num_component)
-    :return:
-    """
-    pi_const = np.log(2.0 * np.pi)
-    num_component = mus.size(0)
-    z_expand = z.unsqueeze(1).repeat(1, num_component, 1)
-    mu_expand = mus.unsqueeze(0).repeat(z.size(0), 1, 1)
-    sd_expand = torch.exp(log_sigma.unsqueeze(0).repeat(z.size(0), 1, 1))
-    dist_term = torch.sum(torch.pow(z_expand - mu_expand, 2) / sd_expand, dim=2)  # size (B, nc)
-    loss = (0.5 * (pi_const + dist_term))
-    # loss = torch.pow(z, 2) * 0.5
-    return loss.sum()
+def get_prior_loss_mm(net, z, x, num_active):
+    all_dist = []
+    for ii in range(num_active):
+        one_hot_y = torch.eye(10)[ii]
+        one_hot_y = one_hot_y.repeat(x.size(0), 1).to(device)
+        recon_x = net(z, one_hot_y)
+        dist = -1.*torch.sum(torch.pow(recon_x - x, 2), dim=-1)
+        all_dist.append(dist.unsqueeze(1))
+    log_pdf = torch.cat(all_dist, dim=1)
+    return log_pdf
 
 
-def get_entropy_loss(z, mus, log_sigma, labels):
-    loss_fcn = nn.CrossEntropyLoss(reduction='sum')
-    num_mu = mus.size(0)
-    latent_dim = mus.size(1)
-    diag_mat = torch.eye(latent_dim).unsqueeze(0).to(device) * torch.exp(log_sigma).unsqueeze(1)
-    log_pdf = dist.MultivariateNormal(mus, diag_mat).log_prob(z.unsqueeze(1).repeat(1, num_mu, 1))
-    yita_c = log_pdf
-    loss = loss_fcn(yita_c, labels)
-    return loss, torch.softmax(yita_c, dim=1)
+def get_entropy_loss(logits, probs):
+    log_q = torch.log_softmax(logits, dim=1)
+    return torch.sum(-torch.sum(probs * log_q, dim=-1))
 
 
-def get_weights(z, x, weights, labels, net, sigma, num_component):
-    loss_fcn = nn.CrossEntropyLoss(reduction='sum')
-    log_prob = []
-    for ii in range(10):
-        one_hot_y = torch.eye(10)
-        one_hot_y = one_hot_y[ii].unsqueeze(0).repeat(z.size(0), 1)
-        pred = net(z, one_hot_y.to(device))
-        recon_loss = -1/(2*sigma**2) * torch.pow(x - pred, 2).sum(dim=1)
-        log_prob.append(recon_loss.unsqueeze(1))
-    log_prob = torch.cat(log_prob, dim=1)
-    log_weights = torch.softmax(log_prob, dim=1)
-    loss = loss_fcn(log_prob, labels)
-    return loss, log_weights
-
-
-def save_model(it, netG, replay_stats, random_seed, log, acc_log, mus, logsigma, fout):
+def save_model(it, netG, latent_state, replay_mem, random_seed, log, acc_log, mus, logsigma, fout):
     torch.save({
-        'it': it + 1,
+        'task_idx': it,
         'state_dict_G': netG.state_dict(),
-        'replay_mem0': replay_stats[0].cpu().detach(),
-        'replay_mem1': replay_stats[1].cpu().detach(),
-        'replay_mem2': replay_stats[2].cpu().detach(),
+        'train_z_state': latent_state.cpu().detach(),
+        'replay_mem0': replay_mem[0].cpu().detach(),
+        'replay_mem1': replay_mem[1].cpu().detach(),
+        'replay_mem2': replay_mem[2].cpu().detach(),
         'random_seed': random_seed,
         'mus': mus.cpu().detach(),
         'logsigma': logsigma.cpu().detach(),
@@ -418,135 +310,23 @@ def save_model(it, netG, replay_stats, random_seed, log, acc_log, mus, logsigma,
     }, fout)
 
 
-def get_class_stats(latent, labels, unique_label=None):
-    assert latent.size(0) == labels.shape[0]
-    if unique_label is None:
-        unique_label = torch.unique(labels)
-    train_stats = {}
-    # train_loc = torch.zeros(len(unique_label), latent.size(1))
-    for ii, label in enumerate(unique_label):
-        mask = labels == label
-        z_samp = latent[mask]
-        var, loc = torch.var_mean(z_samp, dim=0)
-        train_stats[ii] = (loc, var)
-    return train_stats
-
-
-def get_class_stats_imp(locs, sigmas, unique_label):
-    # unique_label = torch.unique(labels)
-    train_stats = {}
-    for ii, label in enumerate(unique_label):
-        train_stats[ii] = (locs[label].detach(), sigmas[label].detach())
-    return train_stats
-
-
-def loc_init_z(locs, unique_labels, latent_dim, data_input):
-    train_z = torch.randn(data_input.size(0), latent_dim)
-    for ii, task_label in enumerate(unique_labels):
-        mask = data_input == task_label
-        diag_mat = torch.exp(locs[task_label][1].to("cpu")) * torch.eye(latent_dim)
-        train_z[mask] = dist.MultivariateNormal(locs[task_label][0].to("cpu"),
-                                                diag_mat.to("cpu")).sample([torch.sum(mask).item()])
-    return train_z
-
-
-def loc_init_mu(prev_mu, cur_mu):
-    ata = torch.matmul(prev_mu, prev_mu.t())
-    inv_ata = torch.inverse(ata)
-    proj_mat = torch.matmul(prev_mu.t(), torch.matmul(inv_ata, prev_mu))
-    new_mu = cur_mu - torch.matmul(proj_mat, cur_mu.t()).t()
-    return new_mu
-
-
-def synthesize_features(netG, z_dim, pi_weights, num_samples, class_stats):
-    """
-    Generate samples for replay
-    :param netG: generator network
-    :param z_dim: latent dimensions
-    :param pi_weights: weights of active components
-    :param num_samples: number of samples to generate
-    :param class_stats: dictionary of component statistics
-    :return:
-    """
-    gen_feas = []
-    gen_labels = []
-    gen_z = []
-    num_component = pi_weights.size(0)
+def synthesize_features(netG, n_samples, n_active_comp, num_k, x_dim, latent_dim):
+    gen_feat = torch.empty(n_active_comp*n_samples, x_dim).float()
+    gen_label = np.zeros([0])
+    replay_z = []
     with torch.no_grad():
-        for ii in range(num_component):
-            # nsamp = int(num_samples * pi_weights[ii])
-            nsamp = num_samples
-            # z = torch.randn(nsamp, z_dim)
-            z = dist.Normal(class_stats[ii][0], torch.ones(z_dim).to(device)).sample([nsamp])
-            one_hot_y = torch.eye(10)
-            one_hot_y = one_hot_y[ii].unsqueeze(0).repeat(nsamp, 1)
-            gen_sample = netG(z.to(device), one_hot_y.to(device))
-            gen_feas.append(gen_sample)
-            gen_labels.append(torch.ones(nsamp) * ii)
-            gen_z.append(z)
-    gen_feas = torch.cat(gen_feas, dim=0)
-    gen_labels = torch.cat(gen_labels, dim=0)
-    gen_z = torch.cat(gen_z, dim=0)
-    return gen_feas, gen_labels.long(), gen_z
+        for ii in range(n_active_comp):
+            one_hot_y = torch.eye(num_k)[ii]
+            one_hot_y = one_hot_y.repeat(n_samples, 1)
+            z = torch.randn(n_samples, latent_dim).to(device)
+            G_sample = netG(z, one_hot_y.to(device))
+            gen_feat[ii * n_samples:(ii + 1) * n_samples] = G_sample
+            gen_label = np.hstack((gen_label, np.ones([n_samples]) * ii))
+            replay_z.append(z)
 
-
-def samp_features(trained_labels, feas, latent_rep, n_samples):
-    unique_trained_labels = np.unique(trained_labels)
-    nclass = len(unique_trained_labels)
-    gen_feat = []
-    gen_label = []
-    gen_z = []
-    for ii in range(nclass):
-        label = unique_trained_labels[ii]
-        mask = trained_labels == label
-        subset_feas = feas[mask]
-        subset_z = latent_rep[mask]
-        subset_labels = trained_labels[mask]
-        if subset_feas.shape[0] < n_samples:
-            subsamp_idx = np.random.choice(np.arange(np.sum(mask)), subset_feas.shape[0], replace=False)
-        else:
-            subsamp_idx = np.random.choice(np.arange(np.sum(mask)), n_samples, replace=False)
-        gen_feat.append(torch.from_numpy(subset_feas[subsamp_idx]))
-        gen_label.append(subset_labels[subsamp_idx])
-        gen_z.append(subset_z[subsamp_idx])
-    gen_feat = torch.cat(gen_feat, dim=0)
-    gen_label = np.concatenate(gen_label)
-    gen_z = torch.cat(gen_z, dim=0)
-    return gen_feat, torch.from_numpy(gen_label.astype(int)), gen_z.detach()
-
-
-def eval_knn(gen_feat, gen_label, test_feats, test_labels, knn):
-    # cosince predict K-nearest Neighbor
-    n_test_sample = test_feats.shape[0]
-    index_boundary = [ii for ii in range(0, n_test_sample, 64)]
-    if index_boundary[-1] < (n_test_sample):
-        index_boundary += [n_test_sample]
-
-    pred_list = []
-    for ii in range(1, len(index_boundary)):
-        start_idx = index_boundary[ii - 1]
-        end_idx = index_boundary[ii]
-        num_samp = test_feats[start_idx:end_idx].shape[0]
-        sim = cosine_similarity(test_feats[start_idx:end_idx], gen_feat)
-        # only count first K nearest neighbor
-        idx_mat = np.argsort(-1 * sim, axis=1)[:, 0:knn]
-        label_mat = gen_label[idx_mat.flatten()].reshape((num_samp, -1))
-        preds = np.zeros(num_samp)
-        for i in range(num_samp):
-            label_count = Counter(label_mat[i]).most_common(1)
-            preds[i] = label_count[0][0]
-        pred_list.append(preds)
-    pred_list = np.concatenate(pred_list)
-    acc = eval_MCA(pred_list, test_labels) * 100
-    return acc
-
-
-def eval_MCA(preds, y):
-    cls_label = np.unique(y)
-    acc = list()
-    for i in cls_label:
-        acc.append((preds[y == i] == i).mean())
-    return np.asarray(acc).mean()
+    gen_label = torch.from_numpy(gen_label).long()
+    replay_z = torch.cat(replay_z, dim=0)
+    return gen_feat, gen_label, replay_z
 
 
 class Result(object):
@@ -587,9 +367,11 @@ class Result(object):
 
 def weights_init(m):
     classname = m.__class__.__name__
-    if 'Linear' in classname:
-        init.normal_(m.weight.data, mean=0, std=0.02)
-        init.constant_(m.bias, 0.0)
+    if classname.find('Conv') != -1:
+        nn.init.kaiming_normal_(m.weight.data, mode='fan_in', nonlinearity='leaky_relu')
+    elif classname.find('BatchNorm') != -1:
+        nn.init.normal_(m.weight.data, 1.0, 0.02)
+        nn.init.constant_(m.bias.data, 0)
 
 
 if __name__ == "__main__":
