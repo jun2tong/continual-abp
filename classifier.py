@@ -105,7 +105,7 @@ def eval_model_cls(net, feats, labels, nsamples, task_stats, latent_dim, sigma, 
 
 
 def eval_model(feats, labels, valid_feas, valid_label, lr_rate, device, num_classes=10):
-    mb_size = 64
+    mb_size = 128
     linear_cls = LinearCLS(feats.size(1), num_classes).to(device)
     optimizer_cls = torch.optim.Adam(linear_cls.parameters(), lr=lr_rate, betas=(0.5, 0.999))
     cls_criterion = nn.NLLLoss()
@@ -114,7 +114,7 @@ def eval_model(feats, labels, valid_feas, valid_label, lr_rate, device, num_clas
     bd_indices = [ii for ii in range(0, feats.size(0), mb_size)]
 
     # Train Linear Classifier
-    for epc in range(20):
+    for epc in range(40):
         batch_indices = np.random.permutation(np.arange(feats.size(0)))
         for idx, iter_count in enumerate(bd_indices):
             batch_idx = batch_indices[iter_count:iter_count + mb_size]

@@ -77,7 +77,7 @@ print(device)
 
 def train():
     # dataset = DATA_LOADER(opt)
-    opt.X_dim = 2048
+    opt.X_dim = 512
     opt.Z_dim = opt.latent_dim
     num_k = 50
 
@@ -304,10 +304,10 @@ def get_prior_loss(z, mus, logsigma):
 #     return log_pdf
 
 
-def get_prior_loss_mm(net, z, x, num_active):
+def get_prior_loss_mm(net, z, x, num_active, num_comps=50):
     all_dist = []
     for ii in range(num_active):
-        one_hot_y = torch.eye(50)[ii]
+        one_hot_y = torch.eye(num_comps)[ii]
         one_hot_y = one_hot_y.repeat(x.size(0), 1).to(device)
         recon_x = net(z, one_hot_y)
         dist = -1.*torch.sum(torch.pow(recon_x - x, 2), dim=-1)

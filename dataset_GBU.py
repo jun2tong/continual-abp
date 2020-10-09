@@ -1,10 +1,14 @@
-import pdb
+import os
+import glob
+import pickle
 import h5py
 import numpy as np
 import scipy.io as sio
-from sklearn import preprocessing
 import torch
-import pickle
+
+from sklearn import preprocessing
+from PIL import Image
+from torch.utils import data
 
 
 def map_label(label, classes):
@@ -43,7 +47,9 @@ class DATA_LOADER(object):
         elif opt.dataset.lower() == 'cifar10':
             self.read_cifar10(opt)
         elif opt.dataset.lower() == 'cifar10feas':
-            self.read_cifar10_feas(opt)
+            self.read_cifar10_feas(opt, "cifar10")
+        elif opt.dataset.lower() == 'cifar100feas':
+            self.read_cifar10_feas(opt, "cifar100")
         elif opt.dataset.lower() == 'cifar10feas_prepool':
             self.read_cifar10feas_prepool(opt)
         else:
@@ -135,8 +141,15 @@ class DATA_LOADER(object):
         self.train_label = torch.tensor(train_targets).long()
         self.test_seen_label = torch.tensor(test_targets).long()
 
-    def read_cifar10_feas(self, opt):
-        checkpoint = torch.load(f"{opt.dataroot}/cifar-10-batches-py/resnet56_feas.tar")
+    def read_cifar10_feas(self, opt, name):
+        # checkpoint = torch.load(f"{opt.dataroot}/cifar-10-batches-py/resnet56_feas.tar")
+        if name == 'cifar10':
+            # checkpoint = torch.load(f"{opt.dataroot}/cifar-10-batches-py/tinyimagenet100/naiveresnet_feas.tar")
+            # checkpoint = torch.load(f"{opt.dataroot}/cifar-10-batches-py/res18_feas.tar")
+            checkpoint = torch.load(f"{opt.dataroot}/cifar-10-batches-py/res18_feas_origsize.tar")
+        else:
+            # checkpoint = torch.load(f"{opt.dataroot}/cifar-100-python/res18_feas_origsize.tar")
+            checkpoint = torch.load(f"{opt.dataroot}/cifar-100-python/vgg16_feas_origsize.tar")
         x_train = checkpoint["x_train"].numpy()
         x_valid = checkpoint["x_valid"].numpy()
         self.train_label = checkpoint['y_train']  # long tensor
@@ -147,7 +160,7 @@ class DATA_LOADER(object):
         _test_seen_feature = scaler.transform(x_valid)
         self.train_feature = torch.from_numpy(_train_feature)
         self.test_seen_feature = torch.from_numpy(_test_seen_feature)
-        self.ntrain_class = 10
+        self.ntrain_class = torch.unique(self.test_seen_label).size(0)
         self.attribute = torch.randn(10, 10).numpy()
 
     def read_cifar10feas_prepool(self, opt):
@@ -212,11 +225,11 @@ class DATA_LOADER(object):
 
 
 class CORE50(object):
-    def __init__(self, task_id):
-        checkpoint = torch.load(f"data/core50/core50feas_task{task_id}.tar")
+    def __init__(self, task_id, model='resnet18'):
+        checkpoint = torch.load(f"data/core50/{model}/core50feas_task{task_id}.tar")
         x_train = checkpoint["x_train"].numpy()
         self.train_label = checkpoint['y_train'].long()
-        checkpoint = torch.load(f"data/core50/core50feas_test_task{task_id}.tar")
+        checkpoint = torch.load(f"data/core50/{model}/core50feas_test_task{task_id}.tar")
         self.test_seen_label = checkpoint["y_valid"].long()
         x_valid = checkpoint["x_valid"].numpy()
 
@@ -322,3 +335,92 @@ class StreamDataLayer(object):
     def get_whole_data(self):
         blobs = {'data': self.feat_data, 'labels': self.label}
         return blobs
+
+
+class TinyImageNet(data.Dataset):
+    """Tiny ImageNet data set available from `http://cs231n.stanford.edu/tiny-imagenet-200.zip`.
+
+    Parameters
+    ----------
+    root: string
+        Root directory including `train`, `test` and `val` subdirectories.
+    split: string
+        Indicating which split to return as a data set.
+        Valid option: [`train`, `test`, `val`]
+    transform: torchvision.transforms
+        A (series) of valid transformation(s).
+    in_memory: bool
+        Set to True if there is enough memory (about 5G) and want to minimize disk IO overhead.
+    """
+
+    def __init__(self, root, split='train', transform=None, in_memory=False):
+        self.root = os.path.expanduser(root)
+        self.split = split
+        self.transform = transform
+        #         self.target_transform = target_transform
+        self.in_memory = in_memory
+        self.split_dir = os.path.join(root, self.split)
+
+        # build class label - number mapping
+        with open(os.path.join(self.root, 'wnids.txt'), 'r') as fp:
+            self.label_texts = sorted([text.strip() for text in fp.readlines()])
+        self.label_text_to_number = {text: i for i, text in enumerate(self.label_texts)}
+
+        if self.split == 'train':
+            assert len(self.label_text_to_number) == 200
+
+            all_img = []
+            all_labels = []
+            for aclass, class_idx in self.label_text_to_number.items():
+                img_paths = glob.glob(os.path.join(self.split_dir, aclass, "images", "*"))
+                assert len(img_paths) == 500
+                img_array = [np.expand_dims(np.asarray(Image.open(an_img).convert('RGB')), axis=0) for an_img in
+                             img_paths]
+                img_array = np.concatenate(img_array, axis=0)
+                img_labels = np.ones(len(img_paths)) * class_idx
+                all_img.append(img_array)
+                all_labels.append(img_labels)
+            self.images = np.concatenate(all_img, axis=0)
+            self.labels = np.concatenate(all_labels)
+
+        elif self.split == 'val':
+            all_labels = []
+            img_paths = []
+            with open(os.path.join(self.split_dir, 'val_annotations.txt'), 'r') as fp:
+                for line in fp.readlines():
+                    terms = line.split('\t')
+                    file_name, label_text = terms[0], terms[1]
+                    img_paths.append(os.path.join(self.split_dir, "images", file_name))
+                    all_labels.append(self.label_text_to_number[label_text])
+            img_array = [np.expand_dims(np.asarray(Image.open(an_img).convert('RGB')), axis=0) for an_img in img_paths]
+            self.images = np.concatenate(img_array, axis=0)
+            self.labels = np.asarray(all_labels)
+
+        mask = self.labels < 100
+        self.images = self.images[mask]
+        self.labels = self.labels[mask]
+
+    def __len__(self):
+        return self.labels.shape[0]
+
+    def __getitem__(self, index):
+
+        if self.transform:
+            img = self.transform(self.images[index])
+        else:
+            img = self.images[index]
+
+        if self.split == 'test':
+            return img
+        else:
+            return img, self.labels[index]
+
+    def __repr__(self):
+        fmt_str = 'Dataset ' + self.__class__.__name__ + '\n'
+        fmt_str += '    Number of datapoints: {}\n'.format(self.__len__())
+        tmp = self.split
+        fmt_str += '    Split: {}\n'.format(tmp)
+        fmt_str += '    Root Location: {}\n'.format(self.root)
+        tmp = '    Transforms (if any): '
+        fmt_str += '{0}{1}\n'.format(tmp, self.transform.__repr__().replace('\n', '\n' + ' ' * len(tmp)))
+        return fmt_str
