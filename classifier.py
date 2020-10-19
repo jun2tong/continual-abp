@@ -4,20 +4,20 @@ import torch.nn as nn
 import torch.distributions as dist
 import sys
 import pdb
-from scipy.optimize import linear_sum_assignment
+# from scipy.optimize import linear_sum_assignment
 from gen_model import LinearCLS
 
 
-def cluster_acc(Y_pred, Y):
-    # from sklearn.utils.linear_assignment_ import linear_assignment
-    assert Y_pred.size(0) == Y.size(0)
-    D = max(Y_pred.max(), Y.max()) + 1
-    weights = np.zeros((D, D), dtype=np.int64)
-    for i in range(Y_pred.size(0)):
-        weights[Y_pred[i], Y[i]] += 1
-    ind = linear_sum_assignment(weights.max() - weights)
-    # return sum([weights[i, j] for i, j in ind]) * 1.0 / Y_pred.size(0)
-    return sum(weights[ind[0], ind[1]]) / Y_pred.size(0) * 100.
+# def cluster_acc(Y_pred, Y):
+#     # from sklearn.utils.linear_assignment_ import linear_assignment
+#     assert Y_pred.size(0) == Y.size(0)
+#     D = max(Y_pred.max(), Y.max()) + 1
+#     weights = np.zeros((D, D), dtype=np.int64)
+#     for i in range(Y_pred.size(0)):
+#         weights[Y_pred[i], Y[i]] += 1
+#     ind = linear_sum_assignment(weights.max() - weights)
+#     # return sum([weights[i, j] for i, j in ind]) * 1.0 / Y_pred.size(0)
+#     return sum(weights[ind[0], ind[1]]) / Y_pred.size(0) * 100.
 
 
 # p(y| x, z)

@@ -1,21 +1,20 @@
-import pdb
+# import pdb
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.init as init
-import torch.distributions as dist
-import torchvision.utils as vutils
+import torch.backends.cudnn as cudnn
+# import torch.nn.init as init
+# import torch.distributions as dist
+# import torchvision.utils as vutils
 
-import matplotlib.pyplot as plt
-import glob
+# import matplotlib.pyplot as plt
+# import glob
 import json
 import argparse
 import os
 import random
 import numpy as np
 from time import gmtime, strftime
-from sklearn.metrics.pairwise import cosine_similarity
-from collections import Counter
 
 from gen_model import FeaturesGenerator
 from classifier import eval_model
@@ -28,12 +27,18 @@ parser.add_argument('--dataset', default='AWA1', help='dataset: CUB, AWA1, AWA2,
 parser.add_argument('--dataroot', default='./data', help='path to dataset')
 parser.add_argument('--validation', action='store_true', default=False, help='enable cross validation mode')
 parser.add_argument('--workers', type=int, help='number of data loading workers', default=4)
-parser.add_argument('--image_embedding', default='res101', type=str)
-parser.add_argument('--class_embedding', default='att', type=str)
+parser.add_argument('--image_embedding', default='res_feas_t1-cifar10', type=str)
 parser.add_argument('--task_split_num', type=int, default=5, help='number of task split')
 
 parser.add_argument('--nepoch', type=int, default=10, help='number of epochs to train for')
+parser.add_argument('--optimizer', default='Adam', help='optimizer: Adam or SGD')
 parser.add_argument('--lr', type=float, default=0.0002, help='learning rate to train generator')
+parser.add_argument('--g_momentum', type=float, default=0.9, help='momentum to train generator')
+parser.add_argument('--g_gamma', type=float, default=0.8, help='training scheduler gamma for generator')
+parser.add_argument('--z_lr', type=float, default=0.0002, help='learning rate to train latent')
+parser.add_argument('--z_momentum', type=float, default=0.9, help='momentum to train latent')
+parser.add_argument('--z_gamma', type=float, default=0.8, help='training scheduler gamma for latent')
+
 parser.add_argument('--classifier_lr', type=float, default=0.001, help='learning rate to train softmax classifier')
 parser.add_argument('--weight_decay', type=float, default=0.001, help='weight_decay')
 parser.add_argument('--batchsize', type=int, default=64, help='input batch size')
@@ -66,7 +71,7 @@ np.random.seed(opt.manualSeed)
 random.seed(opt.manualSeed)
 torch.manual_seed(opt.manualSeed)
 torch.cuda.manual_seed_all(opt.manualSeed)
-import torch.backends.cudnn as cudnn
+
 cudnn.benchmark = True
 device = f"cuda:{opt.gpu}" if torch.cuda.is_available() else "cpu"
 
@@ -93,8 +98,7 @@ def train():
     netG = FeaturesGenerator(opt.Z_dim, num_k, opt.X_dim, opt.gh_dim).to(device)
     netG.apply(weights_init)
     print(netG)
-    out_dir = f'out/{opt.dataset}/nreplay-{opt.nSample}_sigma-{opt.sigma}_langevin_s-{opt.langevin_s}_' \
-              f'step-{opt.langevin_step}_nepoch-{opt.nepoch}'
+    out_dir = f'out/{opt.dataset}/{opt.optimizer}-nreplay-{opt.nSample}-step-{opt.langevin_step}_nepoch-{opt.nepoch}'
     os.makedirs(out_dir, exist_ok=True)
     print("The output dictionary is {}".format(out_dir))
 
@@ -125,6 +129,7 @@ def train():
     all_task_dataloader = {}
     all_task_testdata = {}
     log_print(f"Task Boundary: {task_boundary} \n", log_dir)
+
     for task_idx, tb in enumerate(task_boundary):
 
         task_mask_1 = dataset.train_label >= start_idx
@@ -160,6 +165,15 @@ def train():
             print("========= Skipping Task 1 =========\n")
             continue
 
+        if opt.optimizer == "Adam":
+            optimizer_g = torch.optim.Adam(netG.parameters(), lr=opt.lr,
+                                           weight_decay=opt.weight_decay, betas=(0.5, 0.999))
+        else:
+            optimizer_g = torch.optim.SGD(netG.parameters(), lr=opt.lr,
+                                          momentum=opt.g_momentum,
+                                          weight_decay=opt.weight_decay)
+        scheduler_g = optim.lr_scheduler.StepLR(optimizer_g, step_size=200, gamma=opt.g_gamma)
+
         train_z = torch.randn(task_dataloader.num_obs, opt.Z_dim)
         if task_idx > 0 and replay_stats is not None:
             prev_z_size = replay_stats[-1].size(0)
@@ -169,8 +183,6 @@ def train():
         print(f"============ Task {task_idx+1} ============")
         print(f"Task Labels: {np.unique(task_dataloader.label)}")
         print(f"Task training shape: {task_dataloader.feat_data.shape}")
-        optimizer_g = torch.optim.Adam(netG.parameters(), lr=opt.lr,
-                                       weight_decay=opt.weight_decay, betas=(0.5, 0.999))
         total_niter = int(task_dataloader.num_obs/opt.batchsize) * opt.nepoch
         n_active = len(np.unique(task_dataloader.label))
         for it in range(start_step, total_niter+1):
@@ -183,7 +195,10 @@ def train():
             z_mb.requires_grad_()
 
             optimizer_z = torch.optim.Adam([z_mb], lr=opt.lr, weight_decay=opt.weight_decay, betas=(0.5, 0.999))
-            scheduler_z = optim.lr_scheduler.StepLR(optimizer_z, step_size=5, gamma=0.97)
+            # optimizer_z = torch.optim.SGD([z_mb], lr=opt.z_lr,
+            #                               momentum=opt.z_momentum,
+            #                               weight_decay=opt.weight_decay)
+            scheduler_z = optim.lr_scheduler.StepLR(optimizer_z, step_size=5, gamma=opt.z_gamma)
             # Alternate update weights w and infer latent_batch z
             batch_loss = 0
             for em_step in range(2):  # EM_STEP
@@ -225,7 +240,7 @@ def train():
                 train_z[idx,] = z_mb.data
                 batch_loss += (srmc_loss / opt.langevin_step) + gloss.detach()
             batch_loss /= 2.
-
+            scheduler_g.step()
             if it % opt.disp_interval == 0 and it:
                 log_text = f'Iter-[{it}/{total_niter}]; loss: {batch_loss :.4f}'
                 log_print(log_text, log_dir)
@@ -280,8 +295,8 @@ def show(img, num_iter):
 def log_print(s, log, print_str=True):
     if print_str:
         print(s)
-    with open(log, 'a') as f:
-        f.write(s + '\n')
+    # with open(log, 'a') as f:
+    #     f.write(s + '\n')
 
 
 def log_list(res_arr, log):
@@ -299,19 +314,9 @@ def get_recon_loss(pred, x, sigma):
     return recon_loss
 
 
-# def get_prior_loss(z, mus, logsigma):
-#     log_pdf = 0.5 * torch.sum(np.log(2.0 * np.pi) + logsigma + torch.pow(z - mus, 2) / torch.exp(logsigma))
-#     return log_pdf
-
-
 def get_prior_loss(z):
     log_pdf = 0.5 * torch.sum(np.log(2.0 * np.pi) + torch.pow(z, 2))
     return log_pdf
-
-# def get_prior_loss_mm(z, mus, logsigma):
-#     dist_term = torch.pow(z.unsqueeze(1) - mus.unsqueeze(0), 2) / torch.exp(logsigma.unsqueeze(0))
-#     log_pdf = -0.5 * torch.sum(np.log(2.0 * np.pi) + logsigma.unsqueeze(0) + dist_term, dim=-1)  # (B, nc)
-#     return log_pdf
 
 
 def get_prior_loss_mm(net, z, x, num_active, num_k=100):
@@ -435,4 +440,3 @@ def weights_init(m):
 if __name__ == "__main__":
     for _ in range(opt.repeat):
         train()
-

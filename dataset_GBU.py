@@ -47,11 +47,11 @@ class DATA_LOADER(object):
         elif opt.dataset.lower() == 'cifar10':
             self.read_cifar10(opt)
         elif opt.dataset.lower() == 'cifar10feas':
-            self.read_cifar10_feas(opt, "cifar10")
+            feas_name = f"cifar-10-batches-py/{opt.image_embedding}"
+            self.read_cifar10_feas(opt, feas_name)
         elif opt.dataset.lower() == 'cifar100feas':
-            self.read_cifar10_feas(opt, "cifar100")
-        elif opt.dataset.lower() == 'cifar10feas_prepool':
-            self.read_cifar10feas_prepool(opt)
+            feas_name = f"cifar-100-python/{opt.image_embedding}"
+            self.read_cifar10_feas(opt, feas_name)
         else:
             self.read_matdataset(opt)
         self.index_in_epoch = 0
@@ -142,14 +142,8 @@ class DATA_LOADER(object):
         self.test_seen_label = torch.tensor(test_targets).long()
 
     def read_cifar10_feas(self, opt, name):
-        # checkpoint = torch.load(f"{opt.dataroot}/cifar-10-batches-py/resnet56_feas.tar")
-        if name == 'cifar10':
-            # checkpoint = torch.load(f"{opt.dataroot}/cifar-10-batches-py/tinyimagenet100/naiveresnet_feas.tar")
-            # checkpoint = torch.load(f"{opt.dataroot}/cifar-10-batches-py/res18_feas.tar")
-            checkpoint = torch.load(f"{opt.dataroot}/cifar-10-batches-py/res18_feas_origsize.tar")
-        else:
-            # checkpoint = torch.load(f"{opt.dataroot}/cifar-100-python/res18_feas_origsize.tar")
-            checkpoint = torch.load(f"{opt.dataroot}/cifar-100-python/vgg16_feas_origsize.tar")
+        # name is of the form: cifar-10-batches-py/resnet56_feas.tar
+        checkpoint = torch.load(f"{opt.dataroot}/{name}.tar")
         x_train = checkpoint["x_train"].numpy()
         x_valid = checkpoint["x_valid"].numpy()
         self.train_label = checkpoint['y_train']  # long tensor
@@ -161,21 +155,6 @@ class DATA_LOADER(object):
         self.train_feature = torch.from_numpy(_train_feature)
         self.test_seen_feature = torch.from_numpy(_test_seen_feature)
         self.ntrain_class = torch.unique(self.test_seen_label).size(0)
-        self.attribute = torch.randn(10, 10).numpy()
-
-    def read_cifar10feas_prepool(self, opt):
-        checkpoint = torch.load(f"{opt.dataroot}/cifar10_midfeas.tar")
-        x_train = checkpoint["x_train"].numpy()
-        x_valid = checkpoint["x_valid"].numpy()
-        self.train_label = checkpoint['y_train']  # long tensor
-        self.test_seen_label = checkpoint["y_valid"]  # long tensor
-
-        scaler = preprocessing.MinMaxScaler()
-        _train_feature = scaler.fit_transform(x_train)
-        _test_seen_feature = scaler.transform(x_valid)
-        self.train_feature = torch.from_numpy(_train_feature)
-        self.test_seen_feature = torch.from_numpy(_test_seen_feature)
-        self.ntrain_class = 10
         self.attribute = torch.randn(10, 10).numpy()
 
     def read_matdataset(self, opt):
