@@ -17,7 +17,7 @@ import numpy as np
 from time import gmtime, strftime
 
 from gen_model import FeaturesGenerator
-from classifier import eval_model
+from classifier import eval_model, eval_knn
 from dataset_GBU import FeatDataLayer, DATA_LOADER
 
 
@@ -33,10 +33,11 @@ parser.add_argument('--task_split_num', type=int, default=5, help='number of tas
 parser.add_argument('--nepoch', type=int, default=10, help='number of epochs to train for')
 parser.add_argument('--optimizer', default='Adam', help='optimizer: Adam or SGD')
 parser.add_argument('--lr', type=float, default=0.0002, help='learning rate to train generator')
-parser.add_argument('--g_momentum', type=float, default=0.9, help='momentum to train generator')
+parser.add_argument('--g_momentum', type=float, default=0.9, help='SGD momentum to train generator')
 parser.add_argument('--g_gamma', type=float, default=0.8, help='training scheduler gamma for generator')
+parser.add_argument('--g_step', type=int, default=500, help='number of steps for lr decay.')
 parser.add_argument('--z_lr', type=float, default=0.0002, help='learning rate to train latent')
-parser.add_argument('--z_momentum', type=float, default=0.9, help='momentum to train latent')
+parser.add_argument('--z_momentum', type=float, default=0.9, help='SGD momentum to train latent')
 parser.add_argument('--z_gamma', type=float, default=0.8, help='training scheduler gamma for latent')
 
 parser.add_argument('--classifier_lr', type=float, default=0.001, help='learning rate to train softmax classifier')
@@ -44,22 +45,22 @@ parser.add_argument('--weight_decay', type=float, default=0.001, help='weight_de
 parser.add_argument('--batchsize', type=int, default=64, help='input batch size')
 parser.add_argument('--nSample', type=int, default=300, help='number features to generate per class')
 
-parser.add_argument('--resume',  type=str, help='the model to resume')
+parser.add_argument('--resume', type=str, help='the model to resume')
 parser.add_argument('--disp_interval', type=int, default=200)
 parser.add_argument('--save_task', type=int, default=0)
-parser.add_argument('--evl_interval',  type=int, default=1000)
+parser.add_argument('--evl_interval', type=int, default=1000)
 parser.add_argument('--manualSeed', type=int, help='manual seed')
 
 parser.add_argument('--latent_dim', type=int, default=50, help='dimension of latent z')
 parser.add_argument('--gh_dim',     type=int, default=1024, help='dimension of hidden layer in generator')
 parser.add_argument('--latent_var', type=float, default=1, help='variance of prior distribution z')
 
-parser.add_argument('--sigma',   type=float, default=0.3, help='variance of random noise')
-parser.add_argument('--sigma_U', type=float, default=1,   help='variance of U_tau')
+parser.add_argument('--sigma', type=float, default=0.3, help='variance of random noise')
+parser.add_argument('--sigma_U', type=float, default=1, help='variance of U_tau')
 parser.add_argument('--langevin_s', type=float, default=0.3, help='s in langevin sampling')
 parser.add_argument('--langevin_step', type=int, default=30, help='langevin step in each iteration')
 
-parser.add_argument('--Knn', type=int, default=20, help='K value')
+parser.add_argument('--Knn', type=int, default=0, help='K value')
 parser.add_argument('--gpu', default='0', type=str, help='index of GPU to use')
 opt = parser.parse_args()
 
@@ -125,7 +126,6 @@ def train():
 
     replay_mem = None
 
-    replay_stats = None
     all_task_dataloader = {}
     all_task_testdata = {}
     log_print(f"Task Boundary: {task_boundary} \n", log_dir)
@@ -156,10 +156,9 @@ def train():
         if opt.resume and task_idx < 1:
             if os.path.isfile(opt.resume):
                 netG.load_state_dict(checkpoint['state_dict_G'])
-                replay_stats = (checkpoint['replay_mem0'],
+                replay_mem = (checkpoint['replay_mem0'],
                                 checkpoint['replay_mem1'],
                                 checkpoint['replay_mem2'])
-                replay_mem = (replay_stats[0], replay_stats[1])
             else:
                 print("=> no checkpoint found at '{}'".format(opt.resume))
             print("========= Skipping Task 1 =========\n")
@@ -172,18 +171,19 @@ def train():
             optimizer_g = torch.optim.SGD(netG.parameters(), lr=opt.lr,
                                           momentum=opt.g_momentum,
                                           weight_decay=opt.weight_decay)
-        scheduler_g = optim.lr_scheduler.StepLR(optimizer_g, step_size=200, gamma=opt.g_gamma)
+        scheduler_g = optim.lr_scheduler.StepLR(optimizer_g, step_size=opt.g_step, gamma=opt.g_gamma)
 
         train_z = torch.randn(task_dataloader.num_obs, opt.Z_dim)
-        if task_idx > 0 and replay_stats is not None:
-            prev_z_size = replay_stats[-1].size(0)
-            train_z[:prev_z_size] = replay_stats[-1]
+        if task_idx > 0 and replay_mem is not None:
+            prev_z_size = replay_mem[-1].size(0)
+            train_z[:prev_z_size] = replay_mem[-1]
         train_z = train_z.float().to(device)
 
         print(f"============ Task {task_idx+1} ============")
         print(f"Task Labels: {np.unique(task_dataloader.label)}")
         print(f"Task training shape: {task_dataloader.feat_data.shape}")
-        total_niter = int(task_dataloader.num_obs/opt.batchsize) * opt.nepoch
+        # total_niter = int(task_dataloader.num_obs/opt.batchsize) * opt.nepoch
+        total_niter = opt.nepoch
         n_active = len(np.unique(task_dataloader.label))
         for it in range(start_step, total_niter+1):
             blobs = task_dataloader.forward()
@@ -208,12 +208,12 @@ def train():
                 recon_loss = get_recon_loss(recon_x, x_mb, opt.sigma)  # Reconstruction Loss
 
                 # log_pdfs = get_prior_loss_mm(z_mb, mus, logsigma)
-                log_pdfs = get_prior_loss_mm(netG, z_mb, x_mb, num_k, num_k)
-                entropy_loss = get_entropy_loss(log_pdfs, one_hot_y.to(device))  # Entropy Loss
+                # log_pdfs = get_prior_loss_mm(netG, z_mb, x_mb, num_k, num_k)
+                # entropy_loss = get_entropy_loss(log_pdfs, one_hot_y.to(device))  # Entropy Loss
 
                 prior_loss = get_prior_loss(z_mb)
 
-                gloss = recon_loss + prior_loss + entropy_loss
+                gloss = recon_loss + prior_loss
                 gloss /= x_mb.size(0)
                 gloss.backward()
                 optimizer_g.step()
@@ -259,17 +259,21 @@ def train():
         print(f"============ Task {task_idx + 1} CL Evaluation ============")
         netG.eval()
         test_acc = []
+        knn_test_acc = []
         n_active = len(np.unique(task_dataloader.label))
         replay_mem = synthesize_features(netG, opt.nSample, n_active, num_k, opt.X_dim, opt.Z_dim)
         for atask in range(task_idx + 1):
             print(np.unique(all_task_testdata[atask][1]))
             eval_acc = eval_model(replay_mem[0], replay_mem[1],
-                                  all_task_testdata[task_idx][0], all_task_testdata[task_idx][1],
+                                  all_task_testdata[atask][0], all_task_testdata[atask][1],
                                   opt.classifier_lr, device, n_active)
+            knn_acc = eval_knn(replay_mem[0].numpy(), replay_mem[1].numpy(), 
+                               all_task_testdata[atask][0].numpy(), all_task_testdata[atask][1].numpy(), 20)
             test_acc.append(eval_acc)
+            knn_test_acc.append(knn_acc)
         result_knn.update_task_acc(test_acc)
-        print(f"CL Task Accuracy: {test_acc}")
-        print(f"CL Avg Accuracy: {np.mean(test_acc)}")
+        print(f"CL Task Accuracy: {test_acc}; Knn {knn_test_acc}")
+        print(f"CL Avg Accuracy: {np.mean(test_acc)}; Knn Avg Acc: {np.mean(knn_test_acc)}")
         if task_idx > 0:
             forget_rate = (result_knn.task_acc[-1][0] - result_knn.task_acc[0][0])
             forget_rate /= result_knn.task_acc[0][0]
@@ -282,14 +286,6 @@ def train():
         print(f"============ End of task {task_idx + 1} ============\n")
         netG.train()
     result_knn.log_results(cl_acc_dir)
-
-
-def show(img, num_iter):
-    npimg = img.numpy()
-    plt.figure(figsize=(15,7))
-    plt.imshow(np.transpose(npimg, (1,2,0)), interpolation='nearest')
-    plt.savefig(f"figures/iter-{num_iter}.png")
-    plt.close()
 
 
 def log_print(s, log, print_str=True):
@@ -352,32 +348,12 @@ def save_model(it, netG, latent_state, replay_mem, random_seed, log, acc_log, fo
     }, fout)
 
 
-def get_class_stats(latent, labels):
-    assert latent.size(0) == labels.shape[0]
-    unique_label = np.unique(labels)
-    train_stats = {}
-    # train_loc = torch.zeros(len(unique_label), latent.size(1))
-    for ii, label in enumerate(unique_label):
-        mask = labels == label
-        z_samp = latent[mask]
-        var, loc = torch.var_mean(z_samp, dim=0)
-        train_stats[label] = (loc, var)
-    return train_stats
-
-
-def get_class_stats_imp(locs, sigmas, labels):
-    unique_label = np.unique(labels)
-    train_stats = {}
-    for ii, label in enumerate(unique_label):
-        train_stats[label] = (locs[label].detach(), sigmas[label].detach())
-    return train_stats
-
-
 def synthesize_features(netG, n_samples, n_active_comp, num_k, x_dim, latent_dim):
     gen_feat = torch.empty(n_active_comp*n_samples, x_dim).float()
     gen_label = np.zeros([0])
     replay_z = []
     with torch.no_grad():
+        # z = torch.randn(n_samples, latent_dim).to(device)
         for ii in range(n_active_comp):
             one_hot_y = torch.eye(num_k)[ii]
             one_hot_y = one_hot_y.repeat(n_samples, 1)
