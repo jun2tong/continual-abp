@@ -35,18 +35,23 @@ class CifarNet(nn.Module):
 
 
 class FeaturesGenerator(torch.nn.Module):
-    def __init__(self, latent_dim, num_k, out_dim, hidden_dim=1024):
-        self.num_nodes = latent_dim + num_k
+    def __init__(self, latent_dim, num_k, out_dim, hidden_dim=1024, num_c=0):
+        self.num_nodes = latent_dim + num_k + num_c
         super(FeaturesGenerator, self).__init__()
         self.main = nn.Sequential(nn.Linear(self.num_nodes, hidden_dim),
                                   nn.LeakyReLU(0.2, True),
+                                #   nn.ReLU(True),
+                                  nn.Linear(hidden_dim, hidden_dim),
+                                  nn.LeakyReLU(0.2, True),
                                   nn.Linear(hidden_dim, out_dim),
-                                  # nn.ReLU(True),
                                   nn.Sigmoid()
                                   )
         
-    def forward(self, x, y):
-        in_vec = torch.cat([x, y], dim=1)
+    def forward(self, x, y, cls_c=None):
+        if cls_c is not None:
+            in_vec = torch.cat([x, y, cls_c], dim=1)
+        else:
+            in_vec = torch.cat([x, y], dim=1)
         out = self.main(in_vec)
         return out
 

@@ -1,10 +1,10 @@
-# import pdb
+import pdb
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.backends.cudnn as cudnn
 # import torch.nn.init as init
-# import torch.distributions as dist
+import torch.distributions as dist
 # import torchvision.utils as vutils
 
 # import matplotlib.pyplot as plt
@@ -37,7 +37,7 @@ parser.add_argument('--g_momentum', type=float, default=0.9, help='SGD momentum 
 parser.add_argument('--g_gamma', type=float, default=0.8, help='training scheduler gamma for generator')
 parser.add_argument('--g_step', type=int, default=500, help='number of steps for lr decay.')
 parser.add_argument('--z_lr', type=float, default=0.0002, help='learning rate to train latent')
-parser.add_argument('--z_momentum', type=float, default=0.9, help='SGD momentum to train latent')
+parser.add_argument('--z_step', type=int, default=5, help='number of steps for lr decay for latent.')
 parser.add_argument('--z_gamma', type=float, default=0.8, help='training scheduler gamma for latent')
 
 parser.add_argument('--classifier_lr', type=float, default=0.001, help='learning rate to train softmax classifier')
@@ -55,9 +55,9 @@ parser.add_argument('--latent_dim', type=int, default=50, help='dimension of lat
 parser.add_argument('--gh_dim',     type=int, default=1024, help='dimension of hidden layer in generator')
 parser.add_argument('--latent_var', type=float, default=1, help='variance of prior distribution z')
 
-parser.add_argument('--sigma', type=float, default=0.3, help='variance of random noise')
+parser.add_argument('--sigma', type=float, default=0.1, help='variance of random noise')
 parser.add_argument('--sigma_U', type=float, default=1, help='variance of U_tau')
-parser.add_argument('--langevin_s', type=float, default=0.3, help='s in langevin sampling')
+parser.add_argument('--langevin_s', type=float, default=0.3, help='step size in langevin sampling')
 parser.add_argument('--langevin_step', type=int, default=30, help='langevin step in each iteration')
 
 parser.add_argument('--Knn', type=int, default=0, help='K value')
@@ -94,6 +94,7 @@ def train():
     taskset = dataset.ntrain_class // opt.task_split_num
     task_boundary = [ii for ii in range(0, dataset.ntrain_class+1, taskset)]
     start_idx = task_boundary.pop(0)
+    start_idx = 0
 
     result_knn = Result()
     netG = FeaturesGenerator(opt.Z_dim, num_k, opt.X_dim, opt.gh_dim).to(device)
@@ -138,13 +139,18 @@ def train():
         if replay_mem is not None:
             train_label = torch.cat([replay_mem[1], dataset.train_label[task_mask]], dim=0)
             train_feas = torch.cat([replay_mem[0], dataset.train_feature[task_mask]], dim=0)
+            train_latent = torch.zeros(train_label.size(0), opt.Z_dim)
+            train_latent.data[:replay_mem[-1].size(0)] = replay_mem[-1]
         else:
             train_label = dataset.train_label[task_mask]
             train_feas = dataset.train_feature[task_mask]
+            train_latent = torch.zeros(train_label.size(0), opt.Z_dim).float()
+
         log_print(f"train X: {train_feas.shape}", log_dir)
         log_print(f"train Y : {train_label.shape}", log_dir)
 
-        task_dataloader = FeatDataLayer(train_label.numpy(), train_feas.numpy(), opt.batchsize)
+        task_dataloader = FeatDataLayer(train_label.numpy(), train_feas.numpy(),
+                                        train_latent.numpy(), opt.batchsize)
         all_task_dataloader[task_idx] = task_dataloader
 
         task_mask_1 = dataset.test_seen_label >= start_idx
@@ -153,16 +159,16 @@ def train():
         all_task_testdata[task_idx] = (dataset.test_seen_feature[task_mask], dataset.test_seen_label[task_mask])
         start_idx = tb
 
-        if opt.resume and task_idx < 1:
-            if os.path.isfile(opt.resume):
-                netG.load_state_dict(checkpoint['state_dict_G'])
-                replay_mem = (checkpoint['replay_mem0'],
-                                checkpoint['replay_mem1'],
-                                checkpoint['replay_mem2'])
-            else:
-                print("=> no checkpoint found at '{}'".format(opt.resume))
-            print("========= Skipping Task 1 =========\n")
-            continue
+        # if opt.resume and task_idx < 1:
+        #     if os.path.isfile(opt.resume):
+        #         netG.load_state_dict(checkpoint['state_dict_G'])
+        #         replay_mem = (checkpoint['replay_mem0'],
+        #                         checkpoint['replay_mem1'],
+        #                         checkpoint['replay_mem2'])
+        #     else:
+        #         print("=> no checkpoint found at '{}'".format(opt.resume))
+        #     print("========= Skipping Task 1 =========\n")
+        #     continue
 
         if opt.optimizer == "Adam":
             optimizer_g = torch.optim.Adam(netG.parameters(), lr=opt.lr,
@@ -171,7 +177,9 @@ def train():
             optimizer_g = torch.optim.SGD(netG.parameters(), lr=opt.lr,
                                           momentum=opt.g_momentum,
                                           weight_decay=opt.weight_decay)
-        scheduler_g = optim.lr_scheduler.StepLR(optimizer_g, step_size=opt.g_step, gamma=opt.g_gamma)
+        # scheduler_g = optim.lr_scheduler.StepLR(optimizer_g, step_size=opt.g_step, gamma=opt.g_gamma)
+        # scheduler_g = optim.lr_scheduler.CyclicLR(optimizer_g, base_lr=0.00001, max_lr=opt.lr, step_size_up=opt.g_step, 
+        #                                           cycle_momentum=False, mode='triangular2')
 
         train_z = torch.randn(task_dataloader.num_obs, opt.Z_dim)
         if task_idx > 0 and replay_mem is not None:
@@ -182,8 +190,8 @@ def train():
         print(f"============ Task {task_idx+1} ============")
         print(f"Task Labels: {np.unique(task_dataloader.label)}")
         print(f"Task training shape: {task_dataloader.feat_data.shape}")
-        # total_niter = int(task_dataloader.num_obs/opt.batchsize) * opt.nepoch
-        total_niter = opt.nepoch
+        total_niter = int(task_dataloader.num_obs/opt.batchsize) * opt.nepoch
+        # total_niter = opt.nepoch
         n_active = len(np.unique(task_dataloader.label))
         for it in range(start_step, total_niter+1):
             blobs = task_dataloader.forward()
@@ -193,15 +201,14 @@ def train():
             x_mb = torch.from_numpy(feat_data).to(device)
             z_mb = train_z[idx]
             z_mb.requires_grad_()
+            prev_z = torch.from_numpy(blobs["latent_z"]).to(device)
 
             optimizer_z = torch.optim.Adam([z_mb], lr=opt.lr, weight_decay=opt.weight_decay, betas=(0.5, 0.999))
-            # optimizer_z = torch.optim.SGD([z_mb], lr=opt.z_lr,
-            #                               momentum=opt.z_momentum,
-            #                               weight_decay=opt.weight_decay)
-            scheduler_z = optim.lr_scheduler.StepLR(optimizer_z, step_size=5, gamma=opt.z_gamma)
+            # scheduler_z = optim.lr_scheduler.StepLR(optimizer_z, step_size=opt.z_step, gamma=opt.z_gamma)
+
             # Alternate update weights w and infer latent_batch z
             batch_loss = 0
-            for em_step in range(2):  # EM_STEP
+            for em_step in range(1):  # EM_STEP
                 optimizer_g.zero_grad()
                 one_hot_y = torch.eye(num_k)[y_mb]
                 recon_x = netG(z_mb, one_hot_y.to(device))
@@ -210,37 +217,42 @@ def train():
                 # log_pdfs = get_prior_loss_mm(z_mb, mus, logsigma)
                 # log_pdfs = get_prior_loss_mm(netG, z_mb, x_mb, num_k, num_k)
                 # entropy_loss = get_entropy_loss(log_pdfs, one_hot_y.to(device))  # Entropy Loss
-
-                prior_loss = get_prior_loss(z_mb)
+                prior_loss = get_prior_loss(z_mb, prev_z)
 
                 gloss = recon_loss + prior_loss
                 gloss /= x_mb.size(0)
                 gloss.backward()
+                # torch.nn.utils.clip_grad_norm_(netG.parameters(), 1)
                 optimizer_g.step()
                 srmc_loss = 0
-                for _ in range(opt.langevin_step):
+                for ls_step in range(opt.langevin_step):
                     optimizer_z.zero_grad()
+                    # u_tau = dist.normal.Normal(torch.tensor([0.0]), torch.tensor([1.0])).sample()
                     u_tau = torch.randn(z_mb.size(0), opt.Z_dim).float().to(device)
 
                     one_hot_y = torch.eye(num_k)[y_mb]
                     recon_x = netG(z_mb, one_hot_y.to(device))
                     recon_loss = get_recon_loss(recon_x, x_mb, opt.sigma)
-
-                    prior_loss = get_prior_loss(z_mb)
+                    prior_loss = get_prior_loss(z_mb, prev_z)
 
                     loss = recon_loss + prior_loss
                     loss /= x_mb.size(0)
-                    loss = opt.langevin_s ** 2 / 2 * loss
+                    loss = loss * (opt.langevin_s*opt.langevin_s)/2
+                    # loss = (opt.langevin_s) * loss
                     loss.backward()
+                    # torch.nn.utils.clip_grad_norm_([z_mb], 1)
                     optimizer_z.step()
-                    z_mb.data += u_tau * opt.langevin_s
+                    # TODO: Maybe implement metropolis hastings selection here?
+                    # if ls_step < 1 and it < total_niter//3:
+                    #     z_mb.data += u_tau * opt.langevin_s
                     srmc_loss += loss.detach()
-                    scheduler_z.step()
+                    # scheduler_z.step()
 
                 train_z[idx,] = z_mb.data
                 batch_loss += (srmc_loss / opt.langevin_step) + gloss.detach()
-            batch_loss /= 2.
-            scheduler_g.step()
+            # batch_loss /= 2.
+            # scheduler_g.step()
+
             if it % opt.disp_interval == 0 and it:
                 log_text = f'Iter-[{it}/{total_niter}]; loss: {batch_loss :.4f}'
                 log_print(log_text, log_dir)
@@ -252,6 +264,9 @@ def train():
                 eval_acc = eval_model(replay_mem[0], replay_mem[1],
                                       all_task_testdata[task_idx][0], all_task_testdata[task_idx][1],
                                       opt.classifier_lr, device, n_active)
+                # eval_acc = eval_model(train_feas, train_label,
+                #                       all_task_testdata[task_idx][0], all_task_testdata[task_idx][1],
+                #                       opt.classifier_lr, device, n_active)
                 log_text = f'Eval-[{it}/{total_niter}]; loss: {batch_loss :.4f}; accuracy: {eval_acc: .4f}'
                 log_print(log_text, log_dir)
                 netG.train()
@@ -273,12 +288,12 @@ def train():
             knn_test_acc.append(knn_acc)
         result_knn.update_task_acc(test_acc)
         print(f"CL Task Accuracy: {test_acc}; Knn {knn_test_acc}")
-        print(f"CL Avg Accuracy: {np.mean(test_acc)}; Knn Avg Acc: {np.mean(knn_test_acc)}")
+        print(f"CL Avg Accuracy: {np.mean(test_acc):.4f}; Knn Avg Acc: {np.mean(knn_test_acc):.4f}")
         if task_idx > 0:
             forget_rate = (result_knn.task_acc[-1][0] - result_knn.task_acc[0][0])
             forget_rate /= result_knn.task_acc[0][0]
             print(f"CL Forgetting: {np.abs(forget_rate)*100: .4f}%")
-
+        # replay_mem = synthesize_features(netG, opt.nSample, n_active, num_k, opt.X_dim, opt.Z_dim)
         if opt.save_task and task_idx < 1:
             save_model(it, netG, train_z, replay_mem, opt.manualSeed, log_dir, cl_acc_dir,
                        f"{out_dir}/train_task_{task_idx+1}.tar")
@@ -306,12 +321,15 @@ def log_list(res_arr, log):
 
 
 def get_recon_loss(pred, x, sigma):
-    recon_loss = 1/(2*sigma**2) * torch.pow(x - pred, 2).sum()
+    # recon_loss = nn.functional.binary_cross_entropy(pred, x, reduction='sum')
+    recon_loss = nn.functional.mse_loss(pred, x, reduction='sum') / (2*sigma*sigma)
+    # recon_loss = 1/(2*sigma*sigma) * torch.pow(x - pred, 2).sum()
     return recon_loss
 
 
-def get_prior_loss(z):
-    log_pdf = 0.5 * torch.sum(np.log(2.0 * np.pi) + torch.pow(z, 2))
+def get_prior_loss(z, prev_rep):
+    log_pdf = nn.functional.mse_loss(z,prev_rep,reduction='sum') * 0.5
+    # log_pdf = 0.5 * torch.sum(torch.pow(z - prev_rep, 2))
     return log_pdf
 
 
@@ -406,11 +424,12 @@ class Result(object):
 
 def weights_init(m):
     classname = m.__class__.__name__
-    if classname.find('Conv') != -1:
-        nn.init.kaiming_normal_(m.weight.data, mode='fan_in', nonlinearity='leaky_relu')
-    elif classname.find('BatchNorm') != -1:
-        nn.init.normal_(m.weight.data, 1.0, 0.02)
-        nn.init.constant_(m.bias.data, 0)
+    if classname == "Linear":
+        nn.init.kaiming_normal_(m.weight.data, mode='fan_out', nonlinearity='leaky_relu')
+    # if classname.find('Conv') != -1:
+    # elif classname.find('BatchNorm') != -1:
+    #     nn.init.normal_(m.weight.data, 1.0, 0.02)
+    #     nn.init.constant_(m.bias.data, 0)
 
 
 if __name__ == "__main__":
