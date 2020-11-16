@@ -44,14 +44,14 @@ class DATA_LOADER(object):
         #     self.read_matimagenet(opt)
         # if opt.dataset.lower() == "mnist":
         #     self.read_pt(opt)
-        if opt.dataset.lower() == 'cifar10feas':
+        if opt.pca > 0:
+            self.read_pca(opt, opt.dataset)
+        elif opt.dataset.lower() == 'cifar10feas':
             feas_name = f"cifar-10-batches-py/{opt.image_embedding}"
             self.read_cifar10_feas(opt, feas_name)
         elif opt.dataset.lower() == 'cifar100feas':
             feas_name = f"cifar-100-python/{opt.image_embedding}"
             self.read_cifar10_feas(opt, feas_name)
-        elif opt.pca > 0:
-            self.read_pca(opt, opt.dataset)
         elif opt.dataset.lower() == "cub":
             self.read_train_test(opt, opt.dataset)
         else:
@@ -82,40 +82,24 @@ class DATA_LOADER(object):
         self.attribute = torch.randn(10, 10).numpy()
 
     def read_pca(self, opt, name):
-        checkpoint = torch.load(f"{opt.dataroot}/{name}/pca{opt.pca}.tar")
-        _train_feature = checkpoint["train_feas"].numpy()
-        _test_seen_feature = checkpoint['test_seen_feas'].numpy()
-        _test_unseen_feature = checkpoint['test_unseen_feas'].numpy()
+        checkpoint = torch.load(f"{opt.dataroot}/cifar-100-python/pca{opt.pca}.tar")
+        _train_feature = checkpoint["train_x"]
+        _test_seen_feature = checkpoint['test_x']
+        self.train_label = checkpoint['train_y']  # long tensor
+        self.test_seen_label = checkpoint["test_y"]  # long tensor
 
         scaler = preprocessing.MinMaxScaler()
         _train_feature = scaler.fit_transform(_train_feature)
         _test_seen_feature = scaler.transform(_test_seen_feature)
-        _test_unseen_feature = scaler.transform(_test_unseen_feature)
         self.train_feature = torch.from_numpy(_train_feature).float()
         mx = self.train_feature.max()
         self.train_feature.mul_(1 / mx)
-        self.test_unseen_feature = torch.from_numpy(_test_unseen_feature).float()
-        self.test_unseen_feature.mul_(1 / mx)
         self.test_seen_feature = torch.from_numpy(_test_seen_feature).float()
         self.test_seen_feature.mul_(1 / mx)
-
-        self.train_label = checkpoint['train_label']
-        self.test_seen_label = checkpoint['test_seen_label']
-        self.test_unseen_label = checkpoint['test_unseen_label']
-
-        self.seenclasses = torch.from_numpy(np.unique(self.train_label.numpy()))
-        self.unseenclasses = torch.from_numpy(np.unique(self.test_unseen_label.numpy()))
-        self.ntrain = self.train_feature.size()[0]
-        self.ntrain_class = self.seenclasses.size(0)
-
-        self.train_label = map_label(self.train_label, self.seenclasses)
-        self.test_seen_label = map_label(self.test_seen_label, self.seenclasses)
-        self.test_unseen_label = map_label(self.test_unseen_label, self.unseenclasses)
-
-        matcontent = sio.loadmat(f"{opt.dataroot}/{opt.dataset}/att_splits.mat")
-        self.attribute = torch.from_numpy(matcontent['att'].T).float()
-        self.train_att = self.attribute[self.seenclasses]
-        self.test_att = self.attribute[self.unseenclasses]
+        self.ntrain_class = torch.unique(self.test_seen_label).size(0)
+        self.attribute = torch.randn(10, 10).numpy()
+        # matcontent = sio.loadmat(f"{opt.dataroot}/{opt.dataset}/att_splits.mat")
+        # self.attribute = torch.from_numpy(matcontent['att'].T).float()
 
     def read_train_test(self, opt, name):
         checkpoint = torch.load(f"{opt.dataroot}/{name}/train-test-split.tar")

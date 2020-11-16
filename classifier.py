@@ -5,6 +5,7 @@ import torch.distributions as dist
 import sys
 import pdb
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn import svm
 from collections import Counter
 
 from gen_model import LinearCLS
@@ -23,6 +24,15 @@ def eval_knn(gen_feat, gen_label, test_feas, test_labels, Knn):
         preds[i] = label_count[0][0]
     acc = eval_MCA(preds, test_labels) * 100
     return acc
+
+
+def eval_svm(gen_feat, gen_label, test_feas, test_labels):
+    clf = svm.SVC(decision_function_shape='ovr')
+    clf.fit(gen_feat, gen_label)
+    pred = clf.predict(test_feas)
+    corr_count = np.sum(np.equal(pred, test_labels))
+    acc = corr_count / float(test_labels.shape[0])
+    return acc * 100.
 
 
 def eval_MCA(preds, y):

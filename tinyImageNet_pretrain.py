@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 
 import torchvision.transforms as tv_transforms
 
-from resnet import resnet32
+# from resnet import resnet32
 
 
 device = "cuda:0" if torch.cuda.is_available() else "cpu"

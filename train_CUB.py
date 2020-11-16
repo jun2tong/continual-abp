@@ -17,7 +17,7 @@ import numpy as np
 from time import gmtime, strftime
 
 from gen_model import FeaturesGenerator, CUBGenerator
-from classifier import eval_model, eval_knn, eval_svm
+from classifier import eval_model, eval_knn
 from dataset_GBU import FeatDataLayer, DATA_LOADER
 
 
@@ -35,7 +35,7 @@ parser.add_argument('--gen_type', type=int, default=1, help='generator type')
 parser.add_argument('--nepoch', type=int, default=10, help='number of epochs to train for')
 parser.add_argument('--optimizer', default='Adam', help='optimizer: Adam or SGD')
 parser.add_argument('--lr', type=float, default=0.0002, help='learning rate to train generator')
-parser.add_argument('--g_momentum', type=float, default=0.5, help='SGD momentum to train generator')
+parser.add_argument('--g_momentum', type=float, default=0.9, help='SGD momentum to train generator')
 parser.add_argument('--g_gamma', type=float, default=0.8, help='training scheduler gamma for generator')
 parser.add_argument('--g_step', type=int, default=500, help='number of steps for lr decay.')
 parser.add_argument('--z_lr', type=float, default=0.0002, help='learning rate to train latent')
@@ -63,8 +63,8 @@ parser.add_argument('--langevin_s', type=float, default=0.3, help='step size in 
 parser.add_argument('--langevin_step', type=int, default=30, help='langevin step in each iteration')
 
 parser.add_argument('--Knn', type=int, default=0, help='K value')
-parser.add_argument('--gpu', default='0', type=str, help='index of GPU to use')
 parser.add_argument('--pca', type=int, default=0, help='PCA dimensions')
+parser.add_argument('--gpu', default='0', type=str, help='index of GPU to use')
 opt = parser.parse_args()
 
 
@@ -88,31 +88,24 @@ def train():
     dataset = DATA_LOADER(opt)
     opt.X_dim = dataset.feature_dim
     opt.Z_dim = opt.latent_dim
-    num_k = 10
-    if opt.dataset == "cifar10feas":
-        num_k = 10
-        # taskset = dataset.ntrain_class // opt.task_split_num
-        task_boundary = [ii for ii in range(0, dataset.ntrain_class+1, opt.task_split_num)]
-        start_idx = task_boundary.pop(0)
-    elif opt.dataset == "cifar100feas":
-        num_k = 100
-        # taskset = dataset.ntrain_class // opt.task_split_num
-        task_boundary = [ii for ii in range(opt.first_split, dataset.ntrain_class+1, opt.task_split_num)]
+    num_k = dataset.att_dim
+    # Continual Learning dataset split
+    # taskset = dataset.ntrain_class // opt.task_split_num
+    task_boundary = [ii for ii in range(opt.first_split, dataset.ntrain_class+1, opt.task_split_num)]
+    # start_idx = task_boundary.pop(0)
     start_idx = 0
 
-    result_lin = Result()
-    # result_knn = Result()
-
+    result_knn = Result()
     if opt.gen_type == 1:
+        # netG = FeaturesGenerator(opt.Z_dim, num_k, opt.X_dim, opt.gh_dim, 200).to(device)
         netG = FeaturesGenerator(opt.Z_dim, num_k, opt.X_dim, opt.gh_dim).to(device)
     else:
+        # netG = CUBGenerator(opt.Z_dim, num_k, opt.X_dim, opt.gh_dim, 200).to(device)
         netG = CUBGenerator(opt.Z_dim, num_k, opt.X_dim, opt.gh_dim).to(device)
     netG.apply(weights_init)
     print(netG)
-    if opt.pca > 0:
-        out_dir = f'out/{opt.dataset}/pca{opt.pca}-nepoch-{opt.nepoch}'
-    else:
-        out_dir = f'out/{opt.dataset}/A{opt.task_split_num}-{opt.image_embedding}-nepoch{opt.nepoch}-nSample{opt.nSample}-supp'
+
+    out_dir = f'out/{opt.dataset}/{opt.image_embedding}-nepoch{opt.nepoch}-nSample{opt.nSample}-gentype{opt.gen_type}-A{opt.task_split_num}'
     os.makedirs(out_dir, exist_ok=True)
     print("The output dictionary is {}".format(out_dir))
 
@@ -120,7 +113,7 @@ def train():
     while os.path.isfile(f"{out_dir}/log_it{it:02d}.txt"):
         it += 1
     log_dir = f"{out_dir}/log_it{it:02d}.txt"
-    cl_acc_dir = f"{out_dir}/lin_acc_it{it:02d}.txt"
+    cl_acc_dir = f"{out_dir}/cl_acc_it{it:02d}.txt"
     with open(log_dir, 'w') as f:
         f.write('Training Start:')
         f.write(strftime("%a, %d %b %Y %H:%M:%S +0000", gmtime()) + '\n')
@@ -178,7 +171,6 @@ def train():
             optimizer_g = torch.optim.SGD(netG.parameters(), lr=opt.lr,
                                           momentum=opt.g_momentum,
                                           weight_decay=opt.weight_decay)
-        # scheduler_g = optim.lr_scheduler.StepLR(optimizer_g, step_size=opt.g_step, gamma=opt.g_gamma)
 
         train_z = torch.randn(task_dataloader.num_obs, opt.Z_dim)
         if task_idx > 0 and replay_mem is not None:
@@ -189,7 +181,10 @@ def train():
         print(f"============ Task {task_idx+1} ============")
         print(f"Task Labels: {np.unique(task_dataloader.label)}")
         print(f"Task training shape: {task_dataloader.feat_data.shape}")
-        total_niter = int(task_dataloader.num_obs/opt.batchsize) * opt.nepoch
+        if task_idx > 0:
+            total_niter = int(task_dataloader.num_obs/opt.batchsize) * opt.nepoch
+        else:
+            total_niter = int(task_dataloader.num_obs/opt.batchsize) * 200
         # total_niter = opt.nepoch
         n_active = len(np.unique(task_dataloader.label))
         for it in range(start_step, total_niter+1):
@@ -209,8 +204,9 @@ def train():
             batch_loss = 0
             for em_step in range(1):  # EM_STEP
                 optimizer_g.zero_grad()
-                one_hot_y = torch.eye(num_k)[y_mb]
-                recon_x = netG(z_mb, one_hot_y.to(device))
+                cls_att = dataset.attribute[y_mb]
+                one_hot_y = torch.eye(200)[y_mb]
+                recon_x = netG(z_mb, cls_att.to(device))
                 recon_loss = get_recon_loss(recon_x, x_mb, opt.sigma)  # Reconstruction Loss
 
                 prior_loss = get_prior_loss(z_mb, prev_z)
@@ -218,21 +214,25 @@ def train():
                 gloss = recon_loss + prior_loss
                 gloss /= x_mb.size(0)
                 gloss.backward()
+                # torch.nn.utils.clip_grad_norm_(netG.parameters(), 1)
                 optimizer_g.step()
                 srmc_loss = 0
                 for ls_step in range(opt.langevin_step):
                     optimizer_z.zero_grad()
                     u_tau = torch.randn(z_mb.size(0), opt.Z_dim).float().to(device)
 
-                    one_hot_y = torch.eye(num_k)[y_mb]
-                    recon_x = netG(z_mb, one_hot_y.to(device))
+                    cls_att = dataset.attribute[y_mb]
+                    one_hot_y = torch.eye(200)[y_mb]
+                    recon_x = netG(z_mb, cls_att.to(device))
                     recon_loss = get_recon_loss(recon_x, x_mb, opt.sigma)
                     prior_loss = get_prior_loss(z_mb, prev_z)
 
                     loss = recon_loss + prior_loss
                     loss /= x_mb.size(0)
                     loss = loss * (opt.langevin_s*opt.langevin_s)/2
+
                     loss.backward()
+                    # torch.nn.utils.clip_grad_norm_([z_mb], 1)
                     optimizer_z.step()
                     # TODO: Maybe implement metropolis hastings selection here?
                     if ls_step < 1 and it == int(task_dataloader.num_obs/opt.batchsize):
@@ -252,10 +252,11 @@ def train():
             if it % opt.evl_interval == 0 and it:
                 netG.eval()
                 n_active = len(np.unique(task_dataloader.label))
-                replay_mem = synthesize_features(netG, opt.nSample, n_active, num_k, opt.X_dim, opt.Z_dim)
+                replay_mem = synthesize_feature_test(netG, dataset.attribute, task_dataloader.label, opt)
                 eval_acc = eval_model(replay_mem[0], replay_mem[1],
                                       all_task_testdata[task_idx][0], all_task_testdata[task_idx][1],
                                       opt.classifier_lr, device, n_active)
+
                 log_text = f'Eval-[{it}/{total_niter}]; loss: {batch_loss :.4f}; accuracy: {eval_acc: .4f}'
                 log_print(log_text, log_dir)
                 netG.train()
@@ -265,26 +266,28 @@ def train():
         test_acc = []
         knn_test_acc = []
         n_active = len(np.unique(task_dataloader.label))
-        replay_mem = synthesize_features(netG, opt.nSample, n_active, num_k, opt.X_dim, opt.Z_dim)
-        name_c = 1
-        while os.path.isfile(f"{out_dir}/state-task{task_idx:02d}-{name_c:02d}.tar"):
-            name_c += 1
-        state_name = f"{out_dir}/state-task{task_idx:02d}-{name_c:02d}.tar"
-        # save_state(replay_mem, state_name)
+        replay_mem = synthesize_feature_test(netG, dataset.attribute, task_dataloader.label, opt)
         for atask in range(task_idx + 1):
             print(np.unique(all_task_testdata[atask][1]))
             eval_acc = eval_model(replay_mem[0], replay_mem[1],
                                   all_task_testdata[atask][0], all_task_testdata[atask][1],
                                   opt.classifier_lr, device, n_active)
-            # knn_acc = eval_knn(replay_mem[0].numpy(), replay_mem[1].numpy(), 
-            #                    all_task_testdata[atask][0].numpy(), all_task_testdata[atask][1].numpy(), 17)
+            knn_acc = eval_knn(replay_mem[0].numpy(), replay_mem[1].numpy(), 
+                               all_task_testdata[atask][0].numpy(), all_task_testdata[atask][1].numpy(), 20)
             test_acc.append(eval_acc)
-            # knn_test_acc.append(knn_acc)
-        result_lin.update_task_acc(test_acc)
-        # result_knn.update_task_acc(knn_test_acc)
+            knn_test_acc.append(knn_acc)
+        result_knn.update_task_acc(test_acc)
         print(f"CL Task Accuracy: {test_acc}; Knn {knn_test_acc}")
-        # print(f"CL Avg Accuracy: {np.mean(test_acc):.4f}; Knn Avg Acc: {np.mean(knn_test_acc):.4f}")
-        print(f"CL Avg Accuracy: {np.mean(test_acc):.4f}")
+        print(f"CL Avg Accuracy: {np.mean(test_acc):.4f}; Knn Avg Acc: {np.mean(knn_test_acc):.4f}")
+        # zsl_mem = synthesize_feature_test(netG, dataset.attribute, dataset.unseenclasses, opt)
+        # eval_acc = eval_model(zsl_mem[0], zsl_mem[1],
+        #                       dataset.test_unseen_feature, dataset.test_unseen_label,
+        #                       opt.classifier_lr, device, 200)
+        # print(f"ZSL Eval: {eval_acc}")
+        if task_idx > 0:
+            forget_rate = (result_knn.task_acc[-1][0] - result_knn.task_acc[0][0])
+            forget_rate /= result_knn.task_acc[0][0]
+            print(f"CL Forgetting: {np.abs(forget_rate)*100: .4f}%")
 
         if opt.save_task and task_idx < 1:
             save_model(it, netG, train_z, replay_mem, opt.manualSeed, log_dir, cl_acc_dir,
@@ -292,8 +295,7 @@ def train():
             print(f'Save model to {out_dir}/train_task_{task_idx+1}.tar')
         print(f"============ End of task {task_idx + 1} ============\n")
         netG.train()
-    result_lin.log_results(cl_acc_dir)
-    # result_knn.log_results(knn_acc_dir)
+    result_knn.log_results(cl_acc_dir)
 
 
 def log_print(s, log, print_str=True):
@@ -343,14 +345,6 @@ def get_entropy_loss(logits, probs):
     return torch.sum(-torch.sum(probs * log_q, dim=-1))
 
 
-def save_state(replay_mem, fout):
-    torch.save({
-        'replay_mem0': replay_mem[0].cpu().detach(),
-        'replay_mem1': replay_mem[1].cpu().detach(),
-        'replay_mem2': replay_mem[2].cpu().detach(),
-    }, fout)
-
-
 def save_model(it, netG, latent_state, replay_mem, random_seed, log, acc_log, fout):
     torch.save({
         'it': it + 1,
@@ -367,23 +361,27 @@ def save_model(it, netG, latent_state, replay_mem, random_seed, log, acc_log, fo
     }, fout)
 
 
-def synthesize_features(netG, n_samples, n_active_comp, num_k, x_dim, latent_dim):
-    gen_feat = torch.empty(n_active_comp*n_samples, x_dim).float()
+def synthesize_feature_test(netG, cls_attr, cls_label, opt):
+    unique_labels = np.unique(cls_label)
+    ntest_class = unique_labels.shape[0]
+    gen_feat = torch.FloatTensor(ntest_class * opt.nSample, opt.X_dim)
     gen_label = np.zeros([0])
     replay_z = []
     with torch.no_grad():
-        # z = torch.randn(n_samples, latent_dim).to(device)
-        for ii in range(n_active_comp):
-            one_hot_y = torch.eye(num_k)[ii]
-            one_hot_y = one_hot_y.repeat(n_samples, 1)
-            z = torch.randn(n_samples, latent_dim).to(device)
-            G_sample = netG(z, one_hot_y.to(device))
-            gen_feat[ii * n_samples:(ii + 1) * n_samples] = G_sample
-            gen_label = np.hstack((gen_label, np.ones([n_samples]) * ii))
+        for idx, alab in enumerate(unique_labels):
+            text_feat = cls_attr[alab].unsqueeze(0).repeat(opt.nSample,1)
+            # text_feat = np.tile(cls_attr[i].astype('float32'), (opt.nSample, 1))
+            text_feat = text_feat.cuda()
+            z = torch.randn(opt.nSample, opt.Z_dim).cuda()
+            one_hot_y = torch.eye(200)[idx]
+            one_hot_y = one_hot_y.repeat(opt.nSample, 1)
+            G_sample = netG(z, text_feat)
+            gen_feat[idx*opt.nSample:(idx+1)*opt.nSample] = G_sample
+            gen_label = np.hstack((gen_label, np.ones([opt.nSample])*alab))
             replay_z.append(z)
 
-    gen_label = torch.from_numpy(gen_label).long()
     replay_z = torch.cat(replay_z, dim=0)
+    gen_label = torch.from_numpy(gen_label).long()
     return gen_feat, gen_label, replay_z
 
 
