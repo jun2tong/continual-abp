@@ -1,185 +1,106 @@
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.autograd import Variable
-import torch.optim as optim
-import numpy as np
-import torch.nn.init as init
-from sklearn.preprocessing import MinMaxScaler 
+import torch.distributions as dist
 import sys
 import pdb
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn import svm
+from collections import Counter
+
+from gen_model import LinearCLS
 
 
-def weights_init(m):
-    classname = m.__class__.__name__
-    if 'Linear' in classname:
-        init.xavier_normal_(m.weight.data)
-        init.constant_(m.bias, 0.0)
+def eval_knn(gen_feat, gen_label, test_feas, test_labels, Knn):
+    # cosince predict K-nearest Neighbor
+    n_test_sample = test_feas.shape[0]
+    sim = cosine_similarity(test_feas, gen_feat)
+    # only count first K nearest neighbor
+    idx_mat = np.argsort(-1 * sim, axis=1)[:, 0:Knn]
+    label_mat = gen_label[idx_mat.flatten()].reshape((n_test_sample,-1))
+    preds = np.zeros(n_test_sample)
+    for i in range(n_test_sample):
+        label_count = Counter(label_mat[i]).most_common(1)
+        preds[i] = label_count[0][0]
+    acc = eval_MCA(preds, test_labels) * 100
+    return acc
 
 
-class CLASSIFIER:
-    # train_Y is interger 
-    def __init__(self, _train_X, _train_Y, data_loader, _nclass, _cuda, _lr=0.001, _beta1=0.5, _nepoch=20,
-                 _batch_size=100, MCA=True, device="cpu"):
-        self.train_X = _train_X
-        self.train_Y = _train_Y 
-        self.test_seen_feature = data_loader.test_seen_feature
-        self.test_seen_label = data_loader.test_seen_label 
-        self.seenclasses = data_loader.seenclasses
-        self.ntrain_class = data_loader.ntrain_class
-        self.batch_size = _batch_size
-        self.nepoch = _nepoch
-        self.nclass = _nclass
-        self.input_dim = _train_X.shape[1]
-        self.cuda = _cuda
-        self.MCA = MCA
-        self.model = LINEAR_LOGSOFTMAX(self.input_dim, self.nclass)
-        self.model.apply(weights_init)
-        self.criterion = nn.NLLLoss()
-        self.device = device
-        self.input = torch.FloatTensor(_batch_size, self.input_dim) 
-        self.label = torch.LongTensor(_batch_size) 
-        
-        self.lr = _lr
-        self.beta1 = _beta1
-        # setup optimizer
-        self.optimizer = optim.Adam(self.model.parameters(), lr=_lr, betas=(_beta1, 0.999))
-
-        if self.cuda:
-            self.model.to(device)
-            self.criterion.to(device)
-            self.input = self.input.to(device)
-            self.label = self.label.to(device)
-
-        self.index_in_epoch = 0
-        self.epochs_completed = 0
-        self.ntrain = self.train_X.shape[0]
-
-        self.acc = self.fit()
-
-    def fit(self):
-        best_acc = 0
-        for epoch in range(self.nepoch):
-            for i in range(0, self.ntrain, self.batch_size):
-                # self.model.zero_grad()
-                batch_input, batch_label = self.next_batch(self.batch_size)
-                batch_input = batch_input.to(self.device)
-                batch_label = batch_label.to(self.device)
-                output = self.model(batch_input)
-                loss = self.criterion(output, batch_label)
-
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
-
-            acc = self.val(self.test_seen_feature, self.test_seen_label)
-
-            if acc > best_acc:
-                best_acc = acc
-        return best_acc * 100
-
-    def next_batch(self, batch_size):
-        start = self.index_in_epoch
-        # shuffle the data at the first epoch
-        if self.epochs_completed == 0 and start == 0:
-            perm = torch.randperm(self.ntrain)
-            self.train_X = self.train_X[perm]
-            self.train_Y = self.train_Y[perm]
-        # the last batch
-        if start + batch_size > self.ntrain:
-            self.epochs_completed += 1
-            rest_num_examples = self.ntrain - start
-            if rest_num_examples > 0:
-                X_rest_part = self.train_X[start:self.ntrain]
-                Y_rest_part = self.train_Y[start:self.ntrain]
-            # shuffle the data
-            perm = torch.randperm(self.ntrain)
-            self.train_X = self.train_X[perm]
-            self.train_Y = self.train_Y[perm]
-            # start next epoch
-            start = 0
-            self.index_in_epoch = batch_size - rest_num_examples
-            end = self.index_in_epoch
-            X_new_part = self.train_X[start:end]
-            Y_new_part = self.train_Y[start:end]
-            #print(start, end)
-            if rest_num_examples > 0:
-                return torch.cat((X_rest_part, X_new_part), 0), torch.cat((Y_rest_part, Y_new_part), 0)
-            else:
-                return X_new_part, Y_new_part
-        else:
-            self.index_in_epoch += batch_size
-            end = self.index_in_epoch
-            #print(start, end)
-            # from index start to index end-1
-            return self.train_X[start:end], self.train_Y[start:end]
-
-    def val_gzsl(self, test_X, test_label):
-        start = 0
-        ntest = test_X.size()[0]
-        predicted_label = torch.LongTensor(test_label.size())
-        with torch.no_grad():
-            for i in range(0, ntest, self.batch_size):
-                end = min(ntest, start+self.batch_size)
-                if self.cuda:
-                    output = self.model(test_X[start:end].cuda())
-                else:
-                    output = self.model(test_X[start:end])
-                _, predicted_label[start:end] = torch.max(output.data, 1)
-                start = end
-        if self.MCA:
-            acc = self.eval_MCA(predicted_label.numpy(), test_label.numpy())
-        else:
-            acc = (predicted_label.numpy() == test_label.numpy()).mean()
-        return acc
-
-    def eval_MCA(self, preds, y):
-        cls_label = np.unique(y)
-        acc = list()
-        for i in cls_label:
-            acc.append((preds[y == i] == i).mean())
-        return np.asarray(acc).mean()
-
-    def compute_per_class_acc_gzsl(self, test_label, predicted_label, target_classes):
-        acc_per_class = 0
-        for i in target_classes:
-            idx = (test_label == i)
-            acc_per_class += torch.sum(test_label[idx]==predicted_label[idx]).float() / torch.sum(idx)
-        acc_per_class /= target_classes.size(0)
-        return acc_per_class 
-
-    # test_label is integer 
-    def val(self, test_X, test_label):
-        start = 0
-        ntest = test_X.size()[0]
-        predicted_label = torch.LongTensor(test_label.size())
-        with torch.no_grad():
-            for i in range(0, ntest, self.batch_size):
-                end = min(ntest, start+self.batch_size)
-                if self.cuda:
-                    output = self.model(test_X[start:end].cuda())
-                else:
-                    output = self.model(test_X[start:end])
-                _, predicted_label[start:end] = torch.max(output.data, 1)
-                start = end
-            acc = (predicted_label.numpy() == test_label.numpy()).mean()
-        return acc
-
-    def compute_per_class_acc(self, test_label, predicted_label, nclass):
-        acc_per_class = torch.FloatTensor(nclass).fill_(0)
-        for i in range(nclass):
-            idx = (test_label == i)
-            acc_per_class[i] = torch.sum(test_label[idx]==predicted_label[idx]).float() / torch.sum(idx)
-        return acc_per_class.mean()
+def eval_svm(gen_feat, gen_label, test_feas, test_labels):
+    clf = svm.SVC(decision_function_shape='ovr')
+    clf.fit(gen_feat, gen_label)
+    pred = clf.predict(test_feas)
+    corr_count = np.sum(np.equal(pred, test_labels))
+    acc = corr_count / float(test_labels.shape[0])
+    return acc * 100.
 
 
-class LINEAR_LOGSOFTMAX(nn.Module):
-    def __init__(self, input_dim, nclass):
-        super(LINEAR_LOGSOFTMAX, self).__init__()
-        self.fc = nn.Sequential(nn.Linear(input_dim, 512),
-                                nn.ReLU(),
-                                nn.Linear(512, nclass))
-        self.logic = nn.LogSoftmax(dim=1)
+def eval_MCA(preds, y):
+    cls_label = np.unique(y)
+    acc = list()
+    for i in cls_label:
+        acc.append((preds[y == i] == i).mean())
+    return np.asarray(acc).mean()
 
-    def forward(self, x): 
-        o = self.logic(self.fc(x))
-        return o  
+
+def eval_model(feats, labels, valid_feas, valid_label, lr_rate, device, num_classes=10):
+    mb_size = 128
+    linear_cls = LinearCLS(feats.size(1), num_classes).to(device)
+    optimizer_cls = torch.optim.Adam(linear_cls.parameters(), lr=lr_rate, betas=(0.5, 0.999))
+    cls_criterion = nn.NLLLoss()
+
+    # num_iter = feats.size(0) // mb_size
+    bd_indices = [ii for ii in range(0, feats.size(0), mb_size)]
+
+    # Train Linear Classifier
+    for epc in range(40):
+        batch_indices = np.random.permutation(np.arange(feats.size(0)))
+        for idx, iter_count in enumerate(bd_indices):
+            batch_idx = batch_indices[iter_count:iter_count + mb_size]
+            x_mb = feats[batch_idx].float().to(device)
+            y_mb = labels[batch_idx].to(device)
+            output = linear_cls(x_mb)
+            loss = cls_criterion(output, y_mb)
+            optimizer_cls.zero_grad()
+            loss.backward()
+            optimizer_cls.step()
+
+    # num_iter = valid_feas.size(0) // mb_size
+    bd_indices = [ii for ii in range(0, valid_feas.size(0), mb_size)]
+    batch_indices = np.arange(valid_feas.size(0))
+    corr = 0
+    with torch.no_grad():
+        for idx, iter_count in enumerate(bd_indices):
+            batch_idx = batch_indices[iter_count:iter_count + mb_size]
+            x_mb = valid_feas[batch_idx].float().to(device)
+            y_mb = valid_label[batch_idx].to(device)
+            output = linear_cls(x_mb)
+            pred = torch.argmax(output, dim=1)
+            corr += torch.sum(torch.eq(y_mb, pred))
+
+    acc = 100 * corr.cpu().item() / float(valid_feas.size(0))
+
+    return acc
+
+
+def eval_batch(net, batch_feas, class_stats, latent_dim, nsamples, sigma,
+               num_active_component, num_limit_comp, device):
+    """
+    Evaluate how to process this batch of data.
+    :return:
+    """
+    energies = []
+    with torch.no_grad():
+        for ii in range(num_active_component):
+            z_samp = dist.Normal(class_stats[ii][0],
+                                 torch.ones(latent_dim).to(device)).sample([nsamples])
+            one_hot_y = torch.eye(num_limit_comp)
+            one_hot_y = one_hot_y[ii].unsqueeze(0).repeat(nsamples, 1)
+            x_pred = net(z_samp.to(device), one_hot_y.to(device))  # (nsample, in_dim)
+            x_new_expand = batch_feas.unsqueeze(1).repeat(1, nsamples, 1).to(device)
+            x_pred_expand = x_pred.unsqueeze(0).repeat(batch_feas.size(0), 1, 1)
+            obs_log_pdf = 1/(2 * sigma ** 2) * torch.pow(x_new_expand - x_pred_expand, 2).mean(dim=1).mean(dim=1)
+            energies.append(obs_log_pdf.cpu().unsqueeze(1))
+
+    energies = torch.cat(energies, dim=1)  # (B, num_component)
+    return torch.sum(energies, dim=1)
