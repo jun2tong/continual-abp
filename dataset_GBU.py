@@ -237,7 +237,7 @@ class FeatDataLayer(object):
         return blobs
 
     def get_whole_data(self):
-        blobs = {'data': self.feat_data, 'labels': self.label}
+        blobs = {'data': self.feat_data, 'labels': self.label, 'latent_z': self.latent_z}
         return blobs
 
 

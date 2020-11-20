@@ -31,6 +31,7 @@ parser.add_argument('--image_embedding', default='res_feas_t1-cifar10', type=str
 parser.add_argument('--task_split_num', type=int, default=5, help='number of task split')
 parser.add_argument('--first_split', type=int, default=50, help='first split index')
 parser.add_argument('--gen_type', type=int, default=1, help='generator type')
+parser.add_argument('--use_raw', type=int, default=1, help='whether to use raw.')
 
 parser.add_argument('--nepoch', type=int, default=10, help='number of epochs to train for')
 parser.add_argument('--optimizer', default='Adam', help='optimizer: Adam or SGD')
@@ -112,7 +113,7 @@ def train():
     if opt.pca > 0:
         out_dir = f'out/{opt.dataset}/pca{opt.pca}-nepoch-{opt.nepoch}'
     else:
-        out_dir = f'out/{opt.dataset}/A{opt.task_split_num}-{opt.image_embedding}-nepoch{opt.nepoch}-nSample{opt.nSample}-supp'
+        out_dir = f'out/{opt.dataset}/S{opt.task_split_num}-{opt.image_embedding}-nepoch{opt.nepoch}-nSample{opt.nSample}-raw{opt.use_raw}-supp'
     os.makedirs(out_dir, exist_ok=True)
     print("The output dictionary is {}".format(out_dir))
 
@@ -235,7 +236,8 @@ def train():
                     loss.backward()
                     optimizer_z.step()
                     # TODO: Maybe implement metropolis hastings selection here?
-                    if ls_step < 1 and it == int(task_dataloader.num_obs/opt.batchsize):
+                    if ls_step < 1 and it < int(task_dataloader.num_obs/opt.batchsize):
+                    # if ls_step < 1 and it == 0:
                         z_mb.data += u_tau * opt.langevin_s
                     srmc_loss += loss.detach()
                     # scheduler_z.step()
@@ -285,7 +287,8 @@ def train():
         print(f"CL Task Accuracy: {test_acc}; Knn {knn_test_acc}")
         # print(f"CL Avg Accuracy: {np.mean(test_acc):.4f}; Knn Avg Acc: {np.mean(knn_test_acc):.4f}")
         print(f"CL Avg Accuracy: {np.mean(test_acc):.4f}")
-
+        if opt.use_raw:
+            replay_mem = get_feats(train_feas, train_label, train_z, opt.nSample)
         if opt.save_task and task_idx < 1:
             save_model(it, netG, train_z, replay_mem, opt.manualSeed, log_dir, cl_acc_dir,
                        f"{out_dir}/train_task_{task_idx+1}.tar")
@@ -385,6 +388,32 @@ def synthesize_features(netG, n_samples, n_active_comp, num_k, x_dim, latent_dim
     gen_label = torch.from_numpy(gen_label).long()
     replay_z = torch.cat(replay_z, dim=0)
     return gen_feat, gen_label, replay_z
+
+
+def get_feats(feats, labels, latent_z, n_samples):
+    unique_label = np.unique(labels)
+    feas_mem = []
+    lab_mem = []
+    z_mem = []
+    for alab in unique_label:
+        mask = labels == alab
+        feas = feats[mask]
+        z = latent_z[mask]
+        lab_group = labels[mask]
+        if feas.shape[0] > n_samples:
+            indices = np.random.choice(np.arange(feas.shape[0]), n_samples, replace=False)
+            feas = feas[indices]
+            z = z[indices]
+            lab_group = lab_group[indices]
+
+        feas_mem.append(feas)
+        z_mem.append(z)
+        lab_mem.append(lab_group)
+
+    feas_mem = torch.cat(feas_mem, dim=0)
+    lab_mem = torch.cat(lab_mem, dim=0)
+    z_mem = torch.cat(z_mem, dim=0)
+    return feas_mem, lab_mem, z_mem
 
 
 class Result(object):
