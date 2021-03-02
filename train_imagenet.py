@@ -1,10 +1,8 @@
 import pdb
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.backends.cudnn as cudnn
 # import torch.nn.init as init
-import torch.distributions as dist
 # import torchvision.utils as vutils
 
 # import matplotlib.pyplot as plt
@@ -16,52 +14,45 @@ import random
 import numpy as np
 from time import gmtime, strftime
 
-from gen_model import FeaturesGenerator, CUBGenerator
-from classifier import eval_model, eval_knn, eval_svm
+from models.gen_model import FeaturesGenerator
+from classifier import eval_model, train_classifier
 from dataset_GBU import FeatDataLayer, DATA_LOADER
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--repeat', type=int, default=1, help='number of repeats for experiment')
-parser.add_argument('--dataset', default='AWA1', help='dataset: CUB, AWA1, AWA2, SUN')
+parser.add_argument('--dataset', default='imagenet100', help='dataset: CUB, AWA1, AWA2, SUN')
 parser.add_argument('--dataroot', default='./data', help='path to dataset')
 parser.add_argument('--validation', action='store_true', default=False, help='enable cross validation mode')
 parser.add_argument('--workers', type=int, help='number of data loading workers', default=4)
-parser.add_argument('--image_embedding', default='res_feas_t1-cifar10', type=str)
-parser.add_argument('--task_split_num', type=int, default=5, help='number of task split')
+parser.add_argument('--image_embedding', default='resnet18_imagenet100_feas', type=str)
+parser.add_argument('--task_split_num', type=int, default=10, help='number of task split')
 parser.add_argument('--first_split', type=int, default=50, help='first split index')
-parser.add_argument('--gen_type', type=int, default=1, help='generator type')
-parser.add_argument('--use_raw', type=int, default=1, help='whether to use raw.')
 
-parser.add_argument('--nepoch', type=int, default=10, help='number of epochs to train for')
+parser.add_argument('--nepoch', type=int, default=20, help='number of epochs to train for')
 parser.add_argument('--optimizer', default='Adam', help='optimizer: Adam or SGD')
 parser.add_argument('--lr', type=float, default=0.0002, help='learning rate to train generator')
-parser.add_argument('--g_momentum', type=float, default=0.5, help='SGD momentum to train generator')
-parser.add_argument('--g_gamma', type=float, default=0.8, help='training scheduler gamma for generator')
-parser.add_argument('--g_step', type=int, default=500, help='number of steps for lr decay.')
-parser.add_argument('--z_lr', type=float, default=0.0002, help='learning rate to train latent')
-parser.add_argument('--z_step', type=int, default=5, help='number of steps for lr decay for latent.')
-parser.add_argument('--z_gamma', type=float, default=0.8, help='training scheduler gamma for latent')
+parser.add_argument('--z_lr', type=float, default=0.0001, help='learning rate to train latent')
 
 parser.add_argument('--classifier_lr', type=float, default=0.001, help='learning rate to train softmax classifier')
-parser.add_argument('--weight_decay', type=float, default=0.001, help='weight_decay')
+parser.add_argument('--weight_decay', type=float, default=0., help='weight_decay')
 parser.add_argument('--batchsize', type=int, default=64, help='input batch size')
 parser.add_argument('--nSample', type=int, default=300, help='number features to generate per class')
 
 parser.add_argument('--resume', type=str, help='the model to resume')
-parser.add_argument('--disp_interval', type=int, default=200)
+parser.add_argument('--disp_interval', type=int, default=1000)
 parser.add_argument('--save_task', type=int, default=0)
-parser.add_argument('--evl_interval', type=int, default=1000)
+parser.add_argument('--evl_interval', type=int, default=2000)
 parser.add_argument('--manualSeed', type=int, help='manual seed')
 
-parser.add_argument('--latent_dim', type=int, default=50, help='dimension of latent z')
-parser.add_argument('--gh_dim',     type=int, default=1024, help='dimension of hidden layer in generator')
+parser.add_argument('--latent_dim', type=int, default=100, help='dimension of latent z')
+parser.add_argument('--gh_dim',     type=int, default=2048, help='dimension of hidden layer in generator')
 parser.add_argument('--latent_var', type=float, default=1, help='variance of prior distribution z')
 
 parser.add_argument('--sigma', type=float, default=0.1, help='variance of random noise')
 parser.add_argument('--sigma_U', type=float, default=1, help='variance of U_tau')
 parser.add_argument('--langevin_s', type=float, default=0.3, help='step size in langevin sampling')
-parser.add_argument('--langevin_step', type=int, default=30, help='langevin step in each iteration')
+parser.add_argument('--langevin_step', type=int, default=20, help='langevin step in each iteration')
 
 parser.add_argument('--Knn', type=int, default=0, help='K value')
 parser.add_argument('--gpu', default='0', type=str, help='index of GPU to use')
@@ -89,31 +80,16 @@ def train():
     dataset = DATA_LOADER(opt)
     opt.X_dim = dataset.feature_dim
     opt.Z_dim = opt.latent_dim
-    num_k = 10
-    if opt.dataset == "cifar10feas":
-        num_k = 10
-        # taskset = dataset.ntrain_class // opt.task_split_num
-        task_boundary = [ii for ii in range(0, dataset.ntrain_class+1, opt.task_split_num)]
-        start_idx = task_boundary.pop(0)
-    elif opt.dataset == "cifar100feas":
-        num_k = 100
-        # taskset = dataset.ntrain_class // opt.task_split_num
-        task_boundary = [ii for ii in range(opt.first_split, dataset.ntrain_class+1, opt.task_split_num)]
+    num_k = 100
+    task_boundary = [ii for ii in range(50, dataset.ntrain_class+1, opt.task_split_num)]
     start_idx = 0
-
     result_lin = Result()
-    # result_knn = Result()
 
-    if opt.gen_type == 1:
-        netG = FeaturesGenerator(opt.Z_dim, num_k, opt.X_dim, opt.gh_dim).to(device)
-    else:
-        netG = CUBGenerator(opt.Z_dim, num_k, opt.X_dim, opt.gh_dim).to(device)
+    netG = FeaturesGenerator(opt.Z_dim, num_k, opt.X_dim, opt.gh_dim).to(device)
     netG.apply(weights_init)
     print(netG)
-    if opt.pca > 0:
-        out_dir = f'out/{opt.dataset}/pca{opt.pca}-nepoch-{opt.nepoch}'
-    else:
-        out_dir = f'out/{opt.dataset}/S{opt.task_split_num}-{opt.image_embedding}-nepoch{opt.nepoch}-nSample{opt.nSample}-raw{opt.use_raw}-supp'
+
+    out_dir = f'out/{opt.dataset}/S{opt.task_split_num}-{opt.image_embedding}-nepoch{opt.nepoch}-nSample{opt.nSample}'
     os.makedirs(out_dir, exist_ok=True)
     print("The output dictionary is {}".format(out_dir))
 
@@ -255,9 +231,9 @@ def train():
                 netG.eval()
                 n_active = len(np.unique(task_dataloader.label))
                 replay_mem = synthesize_features(netG, opt.nSample, n_active, num_k, opt.X_dim, opt.Z_dim)
-                eval_acc = eval_model(replay_mem[0], replay_mem[1],
-                                      all_task_testdata[task_idx][0], all_task_testdata[task_idx][1],
-                                      opt.classifier_lr, device, n_active)
+                lin_cls = train_classifier(replay_mem[0], replay_mem[1],
+                                           opt.classifier_lr, device, n_active)
+                eval_acc = eval_model(lin_cls, all_task_testdata[task_idx][0], all_task_testdata[task_idx][1], device)
                 log_text = f'Eval-[{it}/{total_niter}]; loss: {batch_loss :.4f}; accuracy: {eval_acc: .4f}'
                 log_print(log_text, log_dir)
                 netG.train()
@@ -271,6 +247,8 @@ def train():
         #    replay_mem = get_feats(train_feas, train_label, train_z, opt.nSample)
         #else:
         replay_mem = synthesize_features(netG, opt.nSample, n_active, num_k, opt.X_dim, opt.Z_dim)
+        lin_cls = train_classifier(replay_mem[0], replay_mem[1],
+                                   opt.classifier_lr, device, n_active)
         name_c = 1
         while os.path.isfile(f"{out_dir}/state-task{task_idx:02d}-{name_c:02d}.tar"):
             name_c += 1
@@ -278,17 +256,11 @@ def train():
         # save_state(replay_mem, state_name)
         for atask in range(task_idx + 1):
             print(np.unique(all_task_testdata[atask][1]))
-            eval_acc = eval_model(replay_mem[0], replay_mem[1],
-                                  all_task_testdata[atask][0], all_task_testdata[atask][1],
-                                  opt.classifier_lr, device, n_active)
-            # knn_acc = eval_knn(replay_mem[0].numpy(), replay_mem[1].numpy(), 
-            #                    all_task_testdata[atask][0].numpy(), all_task_testdata[atask][1].numpy(), 17)
+            eval_acc = eval_model(lin_cls, all_task_testdata[atask][0], all_task_testdata[atask][1], device)
             test_acc.append(eval_acc)
             # knn_test_acc.append(knn_acc)
         result_lin.update_task_acc(test_acc)
-        # result_knn.update_task_acc(knn_test_acc)
-        print(f"CL Task Accuracy: {test_acc}; Knn {knn_test_acc}")
-        # print(f"CL Avg Accuracy: {np.mean(test_acc):.4f}; Knn Avg Acc: {np.mean(knn_test_acc):.4f}")
+        print(f"CL Task Accuracy: {test_acc}")
         print(f"CL Avg Accuracy: {np.mean(test_acc):.4f}")
         if opt.save_task and task_idx < 1:
             save_model(it, netG, train_z, replay_mem, opt.manualSeed, log_dir, cl_acc_dir,

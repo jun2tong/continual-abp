@@ -4,3 +4,4 @@ figures/**
 .ipynb_checkpoints/**
 .vscode/**
 __pycache__/**
+*/__pycache__/**

@@ -52,6 +52,9 @@ class DATA_LOADER(object):
         elif opt.dataset.lower() == 'cifar100feas':
             feas_name = f"cifar-100-python/{opt.image_embedding}"
             self.read_cifar10_feas(opt, feas_name)
+        elif opt.dataset.lower() == 'imagenet100':
+            feas_name = f"{opt.image_embedding}"
+            self.read_cifar10_feas(opt, feas_name)
         elif opt.dataset.lower() == "cub":
             self.read_train_test(opt, opt.dataset)
         else:
@@ -147,9 +150,6 @@ class DATA_LOADER(object):
         self.test_seen_feature.mul_(1 / mx)
 
         self.test_seen_label = torch.from_numpy(label[test_seen_loc]).long()
-        self.test_unseen_label = torch.from_numpy(label[test_unseen_loc]).long()
-        self.train_label = torch.from_numpy(label[trainval_loc]).long()
-
         self.seenclasses = torch.from_numpy(np.unique(self.train_label.numpy()))
         self.unseenclasses = torch.from_numpy(np.unique(self.test_unseen_label.numpy()))
         self.ntrain = self.train_feature.size()[0]
