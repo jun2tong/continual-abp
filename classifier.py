@@ -35,9 +35,10 @@ def eval_MCA(preds, y):
 
 
 def train_classifier(feats, labels, lr_rate, device, num_classes=10):
-    mb_size = 128
+    mb_size = 512
     linear_cls = LinearCLS(feats.size(1), num_classes).to(device)
     optimizer_cls = torch.optim.Adam(linear_cls.parameters(), lr=lr_rate, betas=(0.5, 0.999))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_cls, T_max=40, eta_min=0.0002)
     cls_criterion = nn.NLLLoss()
 
     # num_iter = feats.size(0) // mb_size
@@ -55,12 +56,12 @@ def train_classifier(feats, labels, lr_rate, device, num_classes=10):
             optimizer_cls.zero_grad()
             loss.backward()
             optimizer_cls.step()
-
+        scheduler.step()
     return linear_cls
 
 
 def eval_model(linear_cls, valid_feas, valid_label, device):
-    mb_size=128
+    mb_size=512
     # num_iter = valid_feas.size(0) // mb_size
     bd_indices = [ii for ii in range(0, valid_feas.size(0), mb_size)]
     batch_indices = np.arange(valid_feas.size(0))

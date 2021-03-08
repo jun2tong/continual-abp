@@ -42,6 +42,7 @@ def train_fn(train_loader, model, criterion, optimizer, epoch, scheduler, device
     # gradient_acc_step = 2
     optimizer.zero_grad()
     for step, (x_mb, labels) in enumerate(train_loader):
+        optimizer.zero_grad()
         # measure data loading time
         data_time.update(time.time() - end)
         img = x_mb.to(device)
@@ -50,18 +51,15 @@ def train_fn(train_loader, model, criterion, optimizer, epoch, scheduler, device
 
         img, targets_a, targets_b, lam = mixup_data(img, labels, 1.0, device)
         y_preds = model(img)
+        # loss = criterion["cls"](y_preds, labels)
         loss = mixup_criterion(criterion["cls"], y_preds, targets_a, targets_b, lam)
 
         # record loss
         losses.update(loss.item(), batch_size)
 
-        if gradient_acc_step > 1:
-            loss = loss / gradient_acc_step
-
         loss.backward()
         if (step+1) % gradient_acc_step == 0:
             optimizer.step()
-            optimizer.zero_grad()
             # scheduler.step()
 
         # measure elapsed time
@@ -133,7 +131,7 @@ def train_loop(train_ds, valid_ds):
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=256,
+        batch_size=512,
         shuffle=True,
         num_workers=4,
         pin_memory=True,
@@ -141,7 +139,7 @@ def train_loop(train_ds, valid_ds):
     )
     valid_loader = DataLoader(
         valid_ds,
-        batch_size=256,
+        batch_size=512,
         shuffle=False,
         num_workers=4,
         pin_memory=True,
@@ -151,12 +149,12 @@ def train_loop(train_ds, valid_ds):
     # ====================================================
     # model & optimizer
     # ====================================================
-    model = resnet50()
-
-    # checkpoint = torch.load("best_706.pth")
-    # model.load_state_dict(checkpoint["model"])
+    model = resnet18(pretrained=True)
+    
+    checkpoint = torch.load("best_res18.pth")
+    model.load_state_dict(checkpoint["model"])
     # teacher_model = resnet50(pretrained=True)
-    model.fc = nn.Linear(2048, 1000)
+    # model.fc = nn.Linear(2048, 1000)
     
     # teacher_model.eval()
     # for param in teacher_model.parameters():
@@ -179,7 +177,7 @@ def train_loop(train_ds, valid_ds):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CFG.epochs, eta_min=CFG.min_lr)
     # scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=CFG.lr, epochs=CFG.epochs, 
     #                                                 steps_per_epoch=len(train_loader), 
-    #                                                 final_div_factor=50,
+    #                                                 final_div_factor=100,
     #                                                 cycle_momentum=False)
     # ====================================================
     # loop
@@ -204,16 +202,16 @@ def train_loop(train_ds, valid_ds):
         LOGGER.info(f"Epoch {epoch+1} - avg_train_loss: {avg_loss:.4f}  avg_val_loss: {avg_val_loss:.4f}  time: {elapsed:.0f}s")
         LOGGER.info(f"Epoch {epoch+1} - Score: {acc:.4f}")
 
-        if avg_val_loss < best_loss:
+        if acc > best_score:
             if avg_val_loss < best_loss:
                 best_loss = avg_val_loss
             if acc > best_score:
                 best_score = acc
             LOGGER.info(f"Epoch {epoch+1} - Save Best Loss: {best_loss:.4f} Best Score {best_score:.4f} Model")
             if torch.cuda.device_count() > 1:
-                torch.save({"model": model.module.state_dict(), "optimizer": optimizer.state_dict()}, f"best_res50.pth")
+                torch.save({"model": model.module.state_dict(), "optimizer": optimizer.state_dict()}, f"best_res18.pth")
             else:
-                torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict()}, f"best_res50.pth")
+                torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict()}, f"best_res18.pth")
 
 
 def mixup_data(x, y, alpha=1.0, device="cpu"):
@@ -241,12 +239,12 @@ if __name__=="__main__":
                         type=str, help="datapath")
     args = parser.parse_args()
     DATADIR = args.data
-    # DATADIR = os.path.expanduser("~/project/data/ILSVR2012/")
+    DATADIR = os.path.expanduser("~/project/data/ILSVR2012/")
     train_data_path = os.path.join(DATADIR,"train")
     val_data_path = os.path.join(DATADIR,"val")
 
     # Select the first 500
-    class_lst = glob.glob(os.path.join(train_data_path,'*'))[:500]
+    class_lst = glob.glob(os.path.join(train_data_path,'*'))
     label_map = {key.split("/")[-1]: idx for idx, key in enumerate(class_lst)}
     
     train_img_path = [glob.glob(f"{apth}/*.JPEG") for apth in class_lst]
@@ -264,9 +262,9 @@ if __name__=="__main__":
     )
 
     augmentation = [
-            transforms.RandomResizedCrop(256, 256, scale=(0.9, 1.0), p=1),
+            transforms.RandomResizedCrop(256, 256, scale=(0.85,1.), p=1),
             transforms.HorizontalFlip(p=0.5),
-            # transforms.ColorJitter(),
+            transforms.ColorJitter(),
             transforms.RandomCrop(224, 224, True, p=1.),
             normalize,
             ToTensorV2(),
@@ -281,10 +279,9 @@ if __name__=="__main__":
     class CFG:
         lr = 0.0005
         wd = 1e-5
-        epochs = 50
-        min_lr=0.000005
+        epochs = 30
+        min_lr=0.00001
 
-
-    LOGGER = init_logger(f"pre-train-imagenet.log")
+    LOGGER = init_logger(f"imagenet1000.log")
 
     train_loop(train_ds, valid_ds)

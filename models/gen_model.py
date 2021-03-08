@@ -40,10 +40,12 @@ class FeaturesGenerator(torch.nn.Module):
         super(FeaturesGenerator, self).__init__()
         self.main = nn.Sequential(nn.Linear(self.num_nodes, hidden_dim),
                                   nn.LeakyReLU(0.2, True),
-                                #   nn.ReLU(True),
+                                  nn.Linear(hidden_dim, hidden_dim),
+                                  nn.LeakyReLU(0.2, True),
                                   nn.Linear(hidden_dim, hidden_dim),
                                   nn.LeakyReLU(0.2, True),
                                   nn.Linear(hidden_dim, out_dim),
+                                #   nn.ReLU(True),
                                   nn.Sigmoid()
                                   )
         
@@ -138,3 +140,8 @@ class ConditionalGenerator(nn.Module):
         # in_vec = torch.cat([z, c], dim=1)
         output = self.main(z)
         return output
+
+
+if __name__=="__main__":
+    net = FeaturesGenerator(100,100,100, 2048)
+    torch.save({"model": net.state_dict()}, "savemod.pth")
