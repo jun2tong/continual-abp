@@ -1,11 +1,4 @@
-# Latent-mixture
-The focus on this branch:  
-- [x] Using prior that is clustering focus, Gaussian mixture in particular.  
-     - Works well for first and second task, but fails subsequently.  
-     - Model not learning subsequent task.  
-     - The model, p(x|z) = g(z), z from clustering prior.
-- [x] Currently, one cluster per class.  
-- [x] Z for previous class are initialized at previous state. Yield impressive remembering.  
-- [] Limit the proposals to be away from previously learned clusters.
-- [] Regularize the movement of previously learned cluster?
-- [] Initialize new cluster center away from previous center?
+# Source Code for Masters Thesis
+
+Class Incremental Learning with Generative Features Replay.
+
