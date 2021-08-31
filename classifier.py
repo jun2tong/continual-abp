@@ -38,7 +38,7 @@ def train_classifier(feats, labels, lr_rate, device, num_classes=10):
     mb_size = 512
     linear_cls = LinearCLS(feats.size(1), num_classes).to(device)
     optimizer_cls = torch.optim.Adam(linear_cls.parameters(), lr=lr_rate, betas=(0.5, 0.999))
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_cls, T_max=40, eta_min=0.0002)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_cls, T_max=40, eta_min=0.0005)
     cls_criterion = nn.NLLLoss()
 
     # num_iter = feats.size(0) // mb_size

@@ -26,33 +26,33 @@ parser.add_argument('--dataroot', default='./data', help='path to dataset')
 parser.add_argument('--validation', action='store_true', default=False, help='enable cross validation mode')
 parser.add_argument('--workers', type=int, help='number of data loading workers', default=4)
 parser.add_argument('--image_embedding', default='resnet18_imagenet100_feas', type=str)
-parser.add_argument('--task_split_num', type=int, default=100, help='number of task split')
+parser.add_argument('--task_split_num', type=int, default=20, help='number of task split')
 parser.add_argument('--first_split', type=int, default=500, help='first split index')
 
-parser.add_argument('--nepoch', type=int, default=90, help='number of epochs to train for')
+parser.add_argument('--nepoch', type=int, default=100, help='number of epochs to train for')
 parser.add_argument('--optimizer', default='Adam', help='optimizer: Adam or SGD')
-parser.add_argument('--lr', type=float, default=0.001, help='learning rate to train generator')
+parser.add_argument('--lr', type=float, default=0.0005, help='learning rate to train generator')
 parser.add_argument('--z_lr', type=float, default=0.0002, help='learning rate to train latent')
 
 parser.add_argument('--classifier_lr', type=float, default=0.001, help='learning rate to train softmax classifier')
 parser.add_argument('--weight_decay', type=float, default=0., help='weight_decay')
 parser.add_argument('--batchsize', type=int, default=1024, help='input batch size')
-parser.add_argument('--nSample', type=int, default=1000, help='number features to generate per class')
+parser.add_argument('--nSample', type=int, default=800, help='number features to generate per class')
 
 parser.add_argument('--resume', type=str, help='the model to resume')
-parser.add_argument('--disp_interval', type=int, default=10000)
+parser.add_argument('--disp_interval', type=int, default=5000)
 parser.add_argument('--save_task', type=int, default=0)
 parser.add_argument('--evl_interval', type=int, default=20000)
 parser.add_argument('--manualSeed', type=int, help='manual seed')
 
-parser.add_argument('--latent_dim', type=int, default=200, help='dimension of latent z')
+parser.add_argument('--latent_dim', type=int, default=100, help='dimension of latent z')
 parser.add_argument('--gh_dim',     type=int, default=1024, help='dimension of hidden layer in generator')
 parser.add_argument('--latent_var', type=float, default=1, help='variance of prior distribution z')
 
 parser.add_argument('--sigma', type=float, default=0.1, help='variance of random noise')
 parser.add_argument('--sigma_U', type=float, default=1, help='variance of U_tau')
 parser.add_argument('--langevin_s', type=float, default=0.3, help='step size in langevin sampling')
-parser.add_argument('--langevin_step', type=int, default=30, help='langevin step in each iteration')
+parser.add_argument('--langevin_step', type=int, default=20, help='langevin step in each iteration')
 
 parser.add_argument('--Knn', type=int, default=0, help='K value')
 parser.add_argument('--gpu', default='0', type=str, help='index of GPU to use')
@@ -167,7 +167,7 @@ def train():
         print(f"Task training shape: {task_dataloader.feat_data.shape}")
         total_niter = int(task_dataloader.num_obs/opt.batchsize) * opt.nepoch
         if task_idx < 1:
-            total_niter = int(task_dataloader.num_obs/opt.batchsize) * 200
+            total_niter = int(task_dataloader.num_obs/opt.batchsize) * 120
         # total_niter = opt.nepoch
         print(f"{int(task_dataloader.num_obs/opt.batchsize)} iter per epoch")
         n_active = len(np.unique(task_dataloader.label))
@@ -214,37 +214,30 @@ def train():
                     loss = loss * (opt.langevin_s*opt.langevin_s)/2
                     loss.backward()
                     optimizer_z.step()
-                    # TODO: Maybe implement metropolis hastings selection here?
-                    if ls_step < 10 and it < 5*int(task_dataloader.num_obs/opt.batchsize):
-                    # if ls_step < 10 and it < total_niter//3:
-                    # if ls_step < 10:
-                        z_mb.data += u_tau * opt.langevin_s
+                    if ls_step < 5 and it < int(task_dataloader.num_obs/opt.batchsize):
+                        z_mb.data += u_tau * opt.sigma
                     srmc_loss += loss.detach()
 
                 train_z[idx,] = z_mb.data
                 batch_loss += (srmc_loss / opt.langevin_step) + gloss.detach()
 
-            if it == int(total_niter*0.2):
-                optimizer_g.param_groups[0]["lr"] = 0.0006
-
             if it == int(total_niter*0.6):
                 optimizer_g.param_groups[0]["lr"] = 0.0003
 
             if it == int(total_niter*0.8):
-                optimizer_g.param_groups[0]["lr"] = 0.0001
-
-            if it % opt.disp_interval == 0 and it:
-                log_text = f'Iter-[{it}/{total_niter}]; loss: {batch_loss :.4f}'
-                log_print(log_text, log_dir)
+                optimizer_g.param_groups[0]["lr"] = 0.0002
 
             if (it+1) % int(task_dataloader.num_obs/opt.batchsize) == 0:
                 netG.eval()
-                n_active = len(np.unique(task_dataloader.label))
-                replay_mem = synthesize_features(netG, 1200, n_active, num_k, opt.X_dim, opt.Z_dim)
+                # n_active = len(np.unique(task_dataloader.label))
+                # replay_mem = synthesize_features(netG, 300, n_active, num_k, opt.X_dim, opt.Z_dim)
+                replay_mem = synthesize_features(netG, opt.nSample, train_z, task_dataloader.label, num_k, opt.X_dim, opt.Z_dim)
                 # lin_cls = train_classifier(torch.from_numpy(task_dataloader.feat_data), torch.from_numpy(task_dataloader.label).long(),
                 #                            opt.classifier_lr, device, n_active)
                 lin_cls = train_classifier(replay_mem[0], replay_mem[1],
                                            opt.classifier_lr, device, n_active)
+                # lin_cls = train_classifier(torch.from_numpy(task_dataloader.feat_data), torch.from_numpy(task_dataloader.label).long(),
+                #                            opt.classifier_lr, device, n_active)
                 eval_acc = eval_model(lin_cls, all_task_testdata[task_idx][0], all_task_testdata[task_idx][1], device)
                 if eval_acc > best_acc:
                     best_acc = eval_acc
@@ -253,46 +246,36 @@ def train():
                     log_print(log_text, log_dir)
                 netG.train()
 
+            if it % opt.disp_interval == 0 and it:
+                log_text = f'Iter-[{it}/{total_niter}]; loss: {batch_loss :.4f}; acc: {eval_acc}; lr: {optimizer_g.param_groups[0]["lr"]}'
+                log_print(log_text, log_dir)
+
         print(f"============ Task {task_idx + 1} CL Evaluation ============")
         netG.eval()
         test_acc = []
-        knn_test_acc = []
         n_active = len(np.unique(task_dataloader.label))
-        #if opt.use_raw:
-        #    replay_mem = get_feats(train_feas, train_label, train_z, opt.nSample)
-        #else:
         netG.load_state_dict(torch.load("model.pth")["netG"])
-        replay_mem = synthesize_features(netG, opt.nSample, n_active, num_k, opt.X_dim, opt.Z_dim)
+        # replay_mem = synthesize_features(netG, opt.nSample, n_active, num_k, opt.X_dim, opt.Z_dim)
+        replay_mem = synthesize_features(netG, opt.nSample, train_z, task_dataloader.label, num_k, opt.X_dim, opt.Z_dim)
         lin_cls = train_classifier(replay_mem[0], replay_mem[1],
                                    opt.classifier_lr, device, n_active)
-        name_c = 1
-        while os.path.isfile(f"{out_dir}/state-task{task_idx:02d}-{name_c:02d}.tar"):
-            name_c += 1
-        state_name = f"{out_dir}/state-task{task_idx:02d}-{name_c:02d}.tar"
-        # save_state(replay_mem, state_name)
+        # name_c = 1
+        # while os.path.isfile(f"{out_dir}/state-task{task_idx:02d}-{name_c:02d}.tar"):
+        #     name_c += 1
         for atask in range(task_idx + 1):
-            # print(np.unique(all_task_testdata[atask][1]))
             eval_acc = eval_model(lin_cls, all_task_testdata[atask][0], all_task_testdata[atask][1], device)
             test_acc.append(eval_acc)
-            # knn_test_acc.append(knn_acc)
         result_lin.update_task_acc(test_acc)
         print(f"CL Task Accuracy: {test_acc}")
         print(f"CL Avg Accuracy: {np.mean(test_acc):.4f}")
-        if opt.save_task and task_idx < 1:
-            save_model(it, netG, train_z, replay_mem, opt.manualSeed, log_dir, cl_acc_dir,
-                       f"{out_dir}/train_task_{task_idx+1}.tar")
-            print(f'Save model to {out_dir}/train_task_{task_idx+1}.tar')
         print(f"============ End of task {task_idx + 1} ============\n")
         netG.train()
     result_lin.log_results(cl_acc_dir)
-    # result_knn.log_results(knn_acc_dir)
 
 
 def log_print(s, log, print_str=True):
     if print_str:
         print(s)
-    # with open(log, 'a') as f:
-    #     f.write(s + '\n')
 
 
 def log_list(res_arr, log):
@@ -306,8 +289,8 @@ def log_list(res_arr, log):
 
 
 def get_recon_loss(pred, x, sigma):
-    recon_loss = nn.functional.binary_cross_entropy(pred, x, reduction='sum')
-    # recon_loss = nn.functional.mse_loss(pred, x, reduction='sum') / (2*sigma*sigma)
+    # recon_loss = nn.functional.binary_cross_entropy(pred, x, reduction='sum')
+    recon_loss = nn.functional.mse_loss(pred, x, reduction='sum') / (2*sigma*sigma)
     # recon_loss = 1/(2*sigma*sigma) * torch.pow(x - pred, 2).sum()
     return recon_loss
 
@@ -359,7 +342,8 @@ def save_model(it, netG, latent_state, replay_mem, random_seed, log, acc_log, fo
     }, fout)
 
 
-def synthesize_features(netG, n_samples, n_active_comp, num_k, x_dim, latent_dim):
+def synthesize_features(netG, n_samples, latent_vars, labels, num_k, x_dim, latent_dim):
+    n_active_comp = len(np.unique(labels))
     gen_feat = torch.empty(n_active_comp*n_samples, x_dim).float()
     gen_label = np.zeros([0])
     replay_z = []
@@ -368,7 +352,13 @@ def synthesize_features(netG, n_samples, n_active_comp, num_k, x_dim, latent_dim
         for ii in range(n_active_comp):
             one_hot_y = torch.eye(num_k)[ii]
             one_hot_y = one_hot_y.repeat(n_samples, 1)
-            z = torch.randn(n_samples, latent_dim).to(device)
+            mask = labels==ii
+            num_lab = np.sum(mask)
+            if num_lab < n_samples:
+                choice_idx = np.random.choice(np.arange(num_lab), size=(n_samples), replace=True)
+            else:
+                choice_idx = np.random.choice(np.arange(num_lab), size=(n_samples), replace=False)
+            z = latent_vars[mask][choice_idx]
             G_sample = netG(z, one_hot_y.to(device))
             gen_feat[ii * n_samples:(ii + 1) * n_samples] = G_sample
             gen_label = np.hstack((gen_label, np.ones([n_samples]) * ii))
@@ -377,6 +367,26 @@ def synthesize_features(netG, n_samples, n_active_comp, num_k, x_dim, latent_dim
     gen_label = torch.from_numpy(gen_label).long()
     replay_z = torch.cat(replay_z, dim=0)
     return gen_feat, gen_label, replay_z
+
+
+# def synthesize_features(netG, n_samples, n_active_comp, num_k, x_dim, latent_dim):
+#     gen_feat = torch.empty(n_active_comp*n_samples, x_dim).float()
+#     gen_label = np.zeros([0])
+#     replay_z = []
+#     with torch.no_grad():
+#         # z = torch.randn(n_samples, latent_dim).to(device)
+#         for ii in range(n_active_comp):
+#             one_hot_y = torch.eye(num_k)[ii]
+#             one_hot_y = one_hot_y.repeat(n_samples, 1)
+#             z = torch.randn(n_samples, latent_dim).to(device)
+#             G_sample = netG(z, one_hot_y.to(device))
+#             gen_feat[ii * n_samples:(ii + 1) * n_samples] = G_sample
+#             gen_label = np.hstack((gen_label, np.ones([n_samples]) * ii))
+#             replay_z.append(z)
+
+#     gen_label = torch.from_numpy(gen_label).long()
+#     replay_z = torch.cat(replay_z, dim=0)
+    # return gen_feat, gen_label, replay_z
 
 
 def get_feats(feats, labels, latent_z, n_samples):
