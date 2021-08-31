@@ -8,7 +8,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn import svm
 from collections import Counter
 
-from gen_model import LinearCLS
+from models.gen_model import LinearCLS
 
 
 def eval_knn(gen_feat, gen_label, test_feas, test_labels, Knn):
@@ -26,15 +26,6 @@ def eval_knn(gen_feat, gen_label, test_feas, test_labels, Knn):
     return acc
 
 
-def eval_svm(gen_feat, gen_label, test_feas, test_labels):
-    clf = svm.SVC(decision_function_shape='ovr')
-    clf.fit(gen_feat, gen_label)
-    pred = clf.predict(test_feas)
-    corr_count = np.sum(np.equal(pred, test_labels))
-    acc = corr_count / float(test_labels.shape[0])
-    return acc * 100.
-
-
 def eval_MCA(preds, y):
     cls_label = np.unique(y)
     acc = list()
@@ -43,10 +34,11 @@ def eval_MCA(preds, y):
     return np.asarray(acc).mean()
 
 
-def eval_model(feats, labels, valid_feas, valid_label, lr_rate, device, num_classes=10):
-    mb_size = 128
+def train_classifier(feats, labels, lr_rate, device, num_classes=10):
+    mb_size = 512
     linear_cls = LinearCLS(feats.size(1), num_classes).to(device)
     optimizer_cls = torch.optim.Adam(linear_cls.parameters(), lr=lr_rate, betas=(0.5, 0.999))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_cls, T_max=40, eta_min=0.0005)
     cls_criterion = nn.NLLLoss()
 
     # num_iter = feats.size(0) // mb_size
@@ -64,7 +56,12 @@ def eval_model(feats, labels, valid_feas, valid_label, lr_rate, device, num_clas
             optimizer_cls.zero_grad()
             loss.backward()
             optimizer_cls.step()
+        scheduler.step()
+    return linear_cls
 
+
+def eval_model(linear_cls, valid_feas, valid_label, device):
+    mb_size=512
     # num_iter = valid_feas.size(0) // mb_size
     bd_indices = [ii for ii in range(0, valid_feas.size(0), mb_size)]
     batch_indices = np.arange(valid_feas.size(0))

@@ -1,7 +1,7 @@
 import os
 import glob
 import pickle
-import h5py
+# import h5py
 import numpy as np
 import scipy.io as sio
 import torch
@@ -9,6 +9,7 @@ import torch
 from sklearn import preprocessing
 from PIL import Image
 from torch.utils import data
+import pdb
 
 
 def map_label(label, classes):
@@ -52,10 +53,13 @@ class DATA_LOADER(object):
         elif opt.dataset.lower() == 'cifar100feas':
             feas_name = f"cifar-100-python/{opt.image_embedding}"
             self.read_cifar10_feas(opt, feas_name)
+        elif opt.dataset.lower() == 'imagenet100':
+            feas_name = f"{opt.image_embedding}"
+            self.read_cifar10_feas(opt, feas_name)
         elif opt.dataset.lower() == "cub":
             self.read_train_test(opt, opt.dataset)
         else:
-            self.read_matdataset(opt)
+            self.read_full_imagenet(opt)
         self.index_in_epoch = 0
         self.epochs_completed = 0
         self.feature_dim = self.train_feature.shape[1]
@@ -121,48 +125,21 @@ class DATA_LOADER(object):
         matcontent = sio.loadmat(f"{opt.dataroot}/{opt.dataset}/att_splits.mat")
         self.attribute = torch.from_numpy(matcontent['att'].T).float()
 
-    def read_matdataset(self, opt):
-        matcontent = sio.loadmat(f"{opt.dataroot}/{opt.dataset}/{opt.image_embedding}.mat")
-        feature = matcontent['features'].T
-        label = matcontent['labels'].astype(int).squeeze() - 1
-        matcontent = sio.loadmat(f"{opt.dataroot}/{opt.dataset}/att_splits.mat")
-        # numpy array index starts from 0, matlab starts from 1
-        trainval_loc = matcontent['trainval_loc'].squeeze() - 1
-
-        test_seen_loc = matcontent['test_seen_loc'].squeeze() - 1
-        test_unseen_loc = matcontent['test_unseen_loc'].squeeze() - 1
-        self.test_unseen_loc = test_unseen_loc
-        self.attribute = torch.from_numpy(matcontent['att'].T).float()
+    def read_full_imagenet(self, opt):
+        checkpoint = torch.load(f"{opt.dataroot}/imagenet/train/train_data.tar")
+        x_train = checkpoint["train_data"].numpy()[:,:-1]
+        self.train_label = checkpoint['train_data'][:,-1]  # long tensor
+        checkpoint = torch.load(f"{opt.dataroot}/imagenet/val/valid_data.tar")
+        x_valid = checkpoint["valid_data"].numpy()[:,:-1]
+        self.test_seen_label = checkpoint["valid_data"][:,-1]  # long tensor
 
         scaler = preprocessing.MinMaxScaler()
-        _train_feature = scaler.fit_transform(feature[trainval_loc])
-        _test_seen_feature = scaler.transform(feature[test_seen_loc])
-        _test_unseen_feature = scaler.transform(feature[test_unseen_loc])
-        self.train_feature = torch.from_numpy(_train_feature).float()
-        mx = self.train_feature.max()
-        self.train_feature.mul_(1 / mx)
-        self.test_unseen_feature = torch.from_numpy(_test_unseen_feature).float()
-        self.test_unseen_feature.mul_(1 / mx)
-        self.test_seen_feature = torch.from_numpy(_test_seen_feature).float()
-        self.test_seen_feature.mul_(1 / mx)
-
-        self.test_seen_label = torch.from_numpy(label[test_seen_loc]).long()
-        self.test_unseen_label = torch.from_numpy(label[test_unseen_loc]).long()
-        self.train_label = torch.from_numpy(label[trainval_loc]).long()
-
-        self.seenclasses = torch.from_numpy(np.unique(self.train_label.numpy()))
-        self.unseenclasses = torch.from_numpy(np.unique(self.test_unseen_label.numpy()))
-        self.ntrain = self.train_feature.size()[0]
-        self.ntrain_class = self.seenclasses.size(0)
-        # self.train_class = self.seenclasses.clone()
-        self.allclasses = torch.arange(0, self.ntrain_class).long()
-
-        # self.train_label = map_label(self.train_label, self.seenclasses)
-        # self.test_seen_label = map_label(self.test_seen_label, self.seenclasses)
-        # self.test_unseen_label = map_label(self.test_unseen_label, self.unseenclasses)
-
-        self.train_att = self.attribute[self.seenclasses]
-        self.test_att = self.attribute[self.unseenclasses]
+        _train_feature = scaler.fit_transform(x_train)
+        _test_seen_feature = scaler.transform(x_valid)
+        self.train_feature = torch.from_numpy(_train_feature)
+        self.test_seen_feature = torch.from_numpy(_test_seen_feature)
+        self.ntrain_class = torch.unique(self.test_seen_label).size(0)
+        self.attribute = torch.randn(10, 10).numpy()
 
 
 class CORE50(object):
